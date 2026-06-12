@@ -37,28 +37,37 @@ Performance
 
 The metric is **unique frames per second**, measured by md5-hashing a sparse sample of each returned frame and counting distinct hashes. Container fps lies; a library can return the same buffer over and over and look fast. Unique fps cant be faked.
 
+There are two ways to invoke bettercam and dxcam, and they perform very differently:
+
+- **`.grab()` mode**: each Python call goes straight to `AcquireNextFrame`. This is the SHOWY mode, what the lib's README screenshot uses. Fast on a controlled source. Almost nobody writes their actual code this way because you have to handle the polling yourself.
+- **`.start()` + `.get_latest_frame()` mode**: the typical pattern. The lib spawns a bg thread that captures into a ring buffer; you pull from the buffer. This is what every bettercam / dxcam tutorial uses, what real recording code uses, and what shows up in their advertised "FPS" number. It's also significantly slower than the showy mode because the bg thread is a Python loop.
+
+The table shows both, in **valid fps** (non-None returns per second). `%changed` annotates how many consecutive returned frames actually differed (the freshness check):
+
 | capturer | flip_demo (valid fps) | mover.py (valid fps) | mover.py (% changed) |
 | --- | --- | --- | --- |
-| **rustcam grab(cursor=False)** | ~180 | **~177** | **99 %** |
-| rustcam grab(cursor=True) | ~165 | 47 | 91 % |
-| rustcam start/get_latest_frame | ~170 | ~170 (in steady state) | 100 % |
-| rustcam grab_gpu (sustained) | ~180 | ~180 | 100 % |
-| bettercam | ~180 | ~60 | 99 % |
-| dxcam | ~170 | ~55 | 62 % |
-| mss | ~5 | ~43 | 24 % |
+| **rustcam grab(cursor=False)** | **~180** | **~150** | **99 %** |
+| rustcam grab(cursor=True) | ~165 | ~70 | 99 % |
+| rustcam start/get_latest_frame | ~170 | (varies) | 100 % |
+| rustcam grab_gpu (sustained) | ~180 | ~280 calls/s, GPU-resident | 100 % |
+| bettercam `.grab()` | ~180 | ~50 | 51 % |
+| bettercam `.start()/.get_latest_frame()` | **~125** | ~60 | 60 % |
+| dxcam `.grab()` | ~180 | ~65 | 39 % |
+| dxcam `.start()/.get_latest_frame()` | **~155** | **~3** | 93 % |
+| mss | ~8 | ~50 | 21 % |
 
-The metric is **valid fps**, ie how many non-None grabs the lib delivers per second. A library that polls fast but returns the same buffer is honest about it: the `%changed` column on mover.py shows how often consecutive returned frames actually differ. Numbers vary 10-15% run-to-run with normal desktop load; this is a representative run.
+On the controlled flip-model source (`flip_demo` is a tiny native Rust D3D11 app that presents a unique full-screen colour every refresh), in `.grab()` mode all three DDA-based libraries hit the panel rate. In the typical `.start()`-mode usage, bettercam falls to ~125, dxcam to ~155, while rustcam stays at ~170. Their bg threads are Python loops; rustcam's is native.
 
-On the controlled flip-model source (`flip_demo` is a tiny native Rust D3D11 app that presents a unique full-screen colour every refresh), rustcam, bettercam and dxcam all ride the 180 Hz panel rate. DDA is the bottleneck, not the library.
+The moment the stimulus is realistic content (`mover.py` is a borderless PyQt window that orbits across the screen), the gap blows wide open:
 
-The moment the stimulus is realistic content (`mover.py` is a borderless PyQt window that orbits across the screen), the story flips:
+- **rustcam delivers ~150 valid fps**, 99% of consecutive frames are different
+- bettercam in `.start()` mode delivers ~60, but only 60% of those are fresh, so effective ~36 fps
+- dxcam in `.start()` mode delivers ~3 fps, basically broken on this stimulus
+- mss delivers ~50, only 21% fresh
 
-- **rustcam delivers ~177 valid fps**, 99% of consecutive frames are different
-- bettercam delivers ~60, dxcam ~55, mss ~43
+bettercam still advertises "fastest in the world" in its banner; the flip_demo `.grab()` number agrees, but in the real `.start()`-mode it's ~125 fps on the controlled source and ~60 (with 40% of those duplicates) on realistic content.
 
-Thats roughly a 3x gap on the kind of content people actually capture. bettercam still claims "180 fps fastest in the world" in its banner; the flip_demo number agrees, but on real desktop composition the Python per-frame proxy + GIL overhead eats two thirds of the refreshes.
-
-The `cursor=True` cell on mover.py is currently 47 fps. The GDI cursor compositing path (`DrawIconEx` on the GDI-compatible BGRA texture) syncs with the GPU every frame, and that sync costs more when the desktop is also recomposing under it. Use `cursor=False` for the fastest hot path; turn cursor on when you actually need it composited.
+The `cursor=True` cell on mover.py is currently ~70 fps. The GDI cursor compositing path (`DrawIconEx` on the GDI-compatible BGRA texture) syncs with the GPU every frame, and that sync costs more when the desktop is also recomposing under it. Use `cursor=False` for the fastest hot path; turn cursor on when you actually need it composited.
 
 Why this is faster
 ---

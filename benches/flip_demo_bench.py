@@ -212,22 +212,57 @@ def bench_rustcam_gpu(label="rustcam grab_gpu (no readback)"):
         cap.close()
 
 
-def bench_bettercam(label="bettercam"):
+def bench_bettercam_grab(label="bettercam .grab()"):
+    """bettercam.grab() one-shot mode. Each call hits AcquireNextFrame
+    directly. This is the SHOWY mode — fast, but not how typical users
+    invoke bettercam in real code."""
     import bettercam
     cam = bettercam.create(output_idx=0)
     try:
         return bench(label, lambda: cam.grab())
     finally:
         cam.release()
+        import time; time.sleep(0.5)
 
 
-def bench_dxcam(label="dxcam"):
+def bench_bettercam_start(label="bettercam .start/.get_latest_frame"):
+    """The TYPICAL bettercam usage pattern — `.start()` spawns its bg
+    capture thread and `.get_latest_frame()` blocks until a fresh
+    frame is in the ring buffer. This is what every bettercam tutorial
+    and recipe online uses."""
+    import bettercam
+    cam = bettercam.create(output_idx=0)
+    cam.start(target_fps=200, video_mode=False)
+    import time; time.sleep(0.5)
+    try:
+        return bench(label, lambda: cam.get_latest_frame())
+    finally:
+        cam.stop()
+        cam.release()
+        time.sleep(0.5)
+
+
+def bench_dxcam_grab(label="dxcam .grab()"):
     import dxcam
     cam = dxcam.create(output_idx=0)
     try:
         return bench(label, lambda: cam.grab())
     finally:
         cam.release()
+        import time; time.sleep(0.5)
+
+
+def bench_dxcam_start(label="dxcam .start/.get_latest_frame"):
+    import dxcam
+    cam = dxcam.create(output_idx=0)
+    cam.start(target_fps=200, video_mode=False)
+    import time; time.sleep(0.5)
+    try:
+        return bench(label, lambda: cam.get_latest_frame())
+    finally:
+        cam.stop()
+        cam.release()
+        time.sleep(0.5)
 
 
 def bench_mss(label="mss"):
@@ -256,8 +291,10 @@ def run_round(label_prefix, stim_fn):
             bench_rustcam_cursor,
             bench_rustcam_bg,
             bench_rustcam_gpu,
-            bench_bettercam,
-            bench_dxcam,
+            bench_bettercam_grab,
+            bench_bettercam_start,
+            bench_dxcam_grab,
+            bench_dxcam_start,
             bench_mss,
         ):
             try:
