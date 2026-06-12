@@ -6,15 +6,21 @@ mod capture;
 mod convert;
 mod cursor;
 mod errors;
+mod gpu;
+mod pacing;
 mod region;
 
 use crate::capture::{device_info, list_outputs, output_info, Capturer};
 use crate::errors::{AccessLost, CaptureError, CaptureTimeout, DeviceError, DuplicationError};
+use crate::gpu::GpuTexture;
+use crate::pacing::FramesIter;
 
 #[pymodule]
 fn _rustcam(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     m.add_class::<Capturer>()?;
+    m.add_class::<FramesIter>()?;
+    m.add_class::<GpuTexture>()?;
 
     m.add("CaptureError", py.get_type::<CaptureError>())?;
     m.add("DeviceError", py.get_type::<DeviceError>())?;

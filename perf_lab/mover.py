@@ -1,43 +1,34 @@
-"""Background stimulus window that updates its content every tick.
+# A frameless red box that moves continuously in a circle on the primary monitor
+# (position is a function of time, updated as fast as the event loop allows, so
+# every monitor refresh shows it at a new position). Stand-in for "dragging a
+# window around" -- used to measure whether the capture pipeline records the
+# motion at the full refresh rate or collapses it.
+import sys, time, math
+from PyQt5.QtWidgets import QApplication, QWidget
+from PyQt5.QtCore import QTimer, Qt
+from PyQt5.QtGui import QColor, QPainter
 
-Spawned as a subprocess by the benchmark to give the screen pixels that
-visibly change at ~refresh rate, so DDA captures see real uniques (not
-the stale-cache trap where libraries that return last-buffer look fast).
+SECS = float(sys.argv[1]) if len(sys.argv) > 1 else 7.0
 
-Uses tkinter (stdlib) so no GUI deps required.
-"""
-import time
-import tkinter as tk
+class Box(QWidget):
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.fillRect(self.rect(), QColor(255, 40, 40))
 
+app = QApplication(sys.argv)
+w = Box()
+w.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
+w.setAttribute(Qt.WA_ShowWithoutActivating)
+w.resize(200, 200)
+w.show()
 
-def main():
-    root = tk.Tk()
-    root.title("rustcam-stim")
-    root.geometry("400x240+100+100")
-    root.configure(bg="black")
-    root.attributes("-topmost", True)
+t0 = time.perf_counter()
+def tick():
+    t = time.perf_counter() - t0
+    if t > SECS:
+        app.quit(); return
+    a = t * 2 * math.pi * 0.6           # ~0.6 Hz orbit
+    w.move(int(840 + 520 * math.cos(a)), int(430 + 360 * math.sin(a)))
 
-    canvas = tk.Canvas(root, width=400, height=240, bg="black", highlightthickness=0)
-    canvas.pack()
-
-    text = canvas.create_text(
-        200, 120, text="0", fill="white", font=("Courier", 48, "bold")
-    )
-    rect = canvas.create_rectangle(0, 0, 40, 40, fill="lime", outline="")
-
-    state = {"n": 0, "x": 0, "y": 0}
-
-    def tick():
-        state["n"] += 1
-        canvas.itemconfigure(text, text=f"{state['n']:08d}")
-        state["x"] = (state["x"] + 7) % 360
-        state["y"] = (state["y"] + 5) % 200
-        canvas.coords(rect, state["x"], state["y"], state["x"] + 40, state["y"] + 40)
-        root.after(1, tick)
-
-    root.after(1, tick)
-    root.mainloop()
-
-
-if __name__ == "__main__":
-    main()
+timer = QTimer(); timer.timeout.connect(tick); timer.start(0)
+app.exec_()

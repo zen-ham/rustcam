@@ -1,39 +1,51 @@
 """Shared pytest fixtures for rustcam tests.
 
-Tests that need an actual DDA frame use the `moving_cursor` fixture, which
-jiggles the OS cursor between calls to satisfy DDA's "wait for content
-change" contract.
+The session-scoped `stim_proc` fixture spawns a tkinter window with
+continuous canvas redraws (see `_stim_window.py`). This drives DDA without
+moving the user's real cursor, which was the old approach (SetCursorPos)
+and was visible / disruptive on the user's desktop.
 """
-import ctypes
+import os
+import subprocess
+import sys
 import time
 
 import pytest
 
 
+@pytest.fixture(scope="session", autouse=True)
+def stim_proc():
+    here = os.path.dirname(os.path.abspath(__file__))
+    script = os.path.join(here, "_stim_window.py")
+    p = subprocess.Popen(
+        [sys.executable, script],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    time.sleep(1.0)  # let it open + start rendering
+    yield p
+    try:
+        p.terminate()
+        p.wait(timeout=2.0)
+    except Exception:
+        try:
+            p.kill()
+        except Exception:
+            pass
+
+
 @pytest.fixture
-def jiggle():
-    """Returns a callable that nudges the OS cursor to a fresh screen position."""
-    user32 = ctypes.windll.user32
-    state = {"i": 0}
+def grab_one():
+    """Repeatedly grab until a frame comes back, or fail after `tries`.
 
-    def _jiggle():
-        state["i"] += 7
-        user32.SetCursorPos(400 + (state["i"] % 600), 300 + (state["i"] % 400))
-        time.sleep(0.001)
-
-    return _jiggle
-
-
-@pytest.fixture
-def grab_one(jiggle):
-    """Repeatedly jiggles + grabs until a frame is returned, or fails after `tries`."""
-
+    The session-scoped tkinter stimulus is redrawing continuously, so
+    timeouts under a few hundred ms get plenty of frames.
+    """
     def _g(cap, tries=30, **kwargs):
         for _ in range(tries):
-            jiggle()
             f = cap.grab(timeout_ms=200, **kwargs)
             if f is not None:
                 return f
-        pytest.fail(f"grab() returned None after {tries} retries with cursor jitter")
+        pytest.fail(f"grab() returned None after {tries} retries (stimulus stopped?)")
 
     return _g

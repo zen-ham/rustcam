@@ -33,7 +33,10 @@ use windows::Win32::UI::HiDpi::{
 use crate::convert::{bgra_to, Fmt};
 use crate::cursor::{draw_cursor, CursorCache};
 use crate::errors::{map_dxgi, RustcamError};
+use crate::gpu::{GpuProducerState, GpuTexture};
+use crate::pacing::{self, BackgroundHandle, FramesIter, StartOpts};
 use crate::region::{crop_copy_bgra, Region};
+use std::time::Duration;
 
 type CapResult<T> = std::result::Result<T, RustcamError>;
 
@@ -63,6 +66,8 @@ pub struct CaptureState {
     pub cursor: bool,
     pub cursor_cache: CursorCache,
     pub adapter_luid: (u32, i32),
+    /// Lazy GPU-shared producer state for `grab_gpu()`.
+    pub gpu: Option<GpuProducerState>,
 }
 
 impl CaptureState {
@@ -168,6 +173,7 @@ impl CaptureState {
                 cursor,
                 cursor_cache: CursorCache::new(),
                 adapter_luid,
+                gpu: None,
             };
 
             // Discard the first DDA frame (often black on warm-up).
@@ -237,8 +243,17 @@ pub struct Capturer {
     region: Region,
     device_idx: u32,
     output_idx: u32,
+    /// Cached info available even when state has moved into a bg thread.
+    cached_width: u32,
+    cached_height: u32,
+    cached_rotation: u32,
+    cached_cursor: bool,
+    /// Set on close(); any further method call raises RuntimeError.
+    closed: bool,
     /// Set while a frames() iterator is alive; blocks grab/start/grab_gpu.
     pub(crate) busy: Arc<AtomicBool>,
+    /// Background-capture handle for start()/stop() mode.
+    bg: Option<BackgroundHandle>,
 }
 
 #[pymethods]
@@ -257,23 +272,35 @@ impl Capturer {
             Some(t) => Region::from_tuple(t, state.width, state.height)?,
             None => full,
         };
+        let cached_width = state.width;
+        let cached_height = state.height;
+        let cached_rotation = state.rotation;
+        let cached_cursor = state.cursor;
         Ok(Self {
             state: Some(state),
             region,
             device_idx: device,
             output_idx: output,
+            cached_width,
+            cached_height,
+            cached_rotation,
+            cached_cursor,
+            closed: false,
             busy: Arc::new(AtomicBool::new(false)),
+            bg: None,
         })
     }
 
-    // --- read-only state ---
+    // --- read-only state (cached so they remain readable while bg thread owns the state) ---
     #[getter]
     fn width(&self) -> PyResult<u32> {
-        Ok(self.state()?.width)
+        self.check_open()?;
+        Ok(self.cached_width)
     }
     #[getter]
     fn height(&self) -> PyResult<u32> {
-        Ok(self.state()?.height)
+        self.check_open()?;
+        Ok(self.cached_height)
     }
     #[getter]
     fn output_idx(&self) -> u32 {
@@ -285,11 +312,13 @@ impl Capturer {
     }
     #[getter]
     fn cursor(&self) -> PyResult<bool> {
-        Ok(self.state()?.cursor)
+        self.check_open()?;
+        Ok(self.cached_cursor)
     }
     #[getter]
     fn rotation(&self) -> PyResult<u32> {
-        Ok(self.state()?.rotation)
+        self.check_open()?;
+        Ok(self.cached_rotation)
     }
     #[getter]
     fn region(&self) -> (u32, u32, u32, u32) {
@@ -301,8 +330,7 @@ impl Capturer {
     }
     #[getter]
     fn is_capturing(&self) -> bool {
-        // start()/stop() not implemented in v0.0.1 — wired in pacing.rs.
-        false
+        self.bg.is_some() || self.busy.load(Ordering::Acquire)
     }
 
     /// One-shot capture. Returns a (H, W, C) uint8 ndarray, or None on WAIT_TIMEOUT.
@@ -368,8 +396,8 @@ impl Capturer {
         Ok(Some(array))
     }
 
-    /// start() / stop() / get_latest_frame() — placeholder; full implementation arrives
-    /// when the background-thread pacer lands. v0.0.1 raises NotImplemented.
+    /// Spawn a background capture thread fed by AcquireNextFrame.
+    /// Subsequent calls to get_latest_frame() block until a new frame arrives.
     #[pyo3(signature = (target_fps=60, region=None, video_mode=false))]
     fn start(
         &mut self,
@@ -377,26 +405,69 @@ impl Capturer {
         region: Option<(i64, i64, i64, i64)>,
         video_mode: bool,
     ) -> PyResult<()> {
-        let _ = (target_fps, region, video_mode);
-        Err(pyo3::exceptions::PyNotImplementedError::new_err(
-            "start() lands in v0.0.2; use grab() in a loop for now",
-        ))
+        if self.bg.is_some() {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "Capturer is already capturing; call stop() first",
+            ));
+        }
+        if self.busy.load(Ordering::Acquire) {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "Capturer is busy: a frames() iterator is active",
+            ));
+        }
+        let state = self
+            .state
+            .take()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Capturer is closed"))?;
+        let region = match region {
+            Some(t) => match Region::from_tuple(t, state.width, state.height) {
+                Ok(r) => r,
+                Err(e) => {
+                    // restore state on validation failure
+                    self.state = Some(state);
+                    return Err(e.into());
+                }
+            },
+            None => self.region,
+        };
+        let opts = StartOpts { target_fps, region, video_mode };
+        self.bg = Some(pacing::spawn(state, opts));
+        Ok(())
     }
 
     fn stop(&mut self) -> PyResult<()> {
-        Err(pyo3::exceptions::PyNotImplementedError::new_err(
-            "stop() lands in v0.0.2",
-        ))
+        if let Some(bg) = self.bg.take() {
+            let state = bg.stop();
+            self.state = Some(state);
+        }
+        Ok(())
     }
 
+    /// Blocking read of the latest published frame. Always BGRA in v0.0.3.
     #[pyo3(signature = (timeout_ms=None))]
-    fn get_latest_frame(&mut self, timeout_ms: Option<u32>) -> PyResult<()> {
-        let _ = timeout_ms;
-        Err(pyo3::exceptions::PyNotImplementedError::new_err(
-            "get_latest_frame() lands in v0.0.2",
-        ))
+    fn get_latest_frame<'py>(
+        &mut self,
+        py: Python<'py>,
+        timeout_ms: Option<u32>,
+    ) -> PyResult<Option<Bound<'py, PyArray3<u8>>>> {
+        let bg = self.bg.as_ref().ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err("Capturer is not capturing; call start() first")
+        })?;
+        let mb = bg.mailbox.clone();
+        let to = timeout_ms.map(|ms| Duration::from_millis(ms as u64));
+        let h = bg.height as usize;
+        let w = bg.width as usize;
+
+        let took = py.detach(|| pacing::get_latest(&mb, to))?;
+        let buf = match took {
+            Some((_, b)) => b,
+            None => return Ok(None),
+        };
+        let arr = buf.into_pyarray(py);
+        Ok(Some(arr.reshape([h, w, 4])?))
     }
 
+    /// Paced CFR iterator yielding (ndarray, slot_wallclock_seconds).
     #[pyo3(signature = (fps, fmt="bgra", region=None, timeout_ms=5000))]
     fn frames(
         &mut self,
@@ -404,23 +475,102 @@ impl Capturer {
         fmt: &str,
         region: Option<(i64, i64, i64, i64)>,
         timeout_ms: u32,
-    ) -> PyResult<()> {
-        let _ = (fps, fmt, region, timeout_ms);
-        Err(pyo3::exceptions::PyNotImplementedError::new_err(
-            "frames() lands in v0.0.2",
+    ) -> PyResult<FramesIter> {
+        if fps == 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "frames(fps=) must be > 0",
+            ));
+        }
+        if self.bg.is_some() {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "Capturer is in background mode; call stop() first",
+            ));
+        }
+        if self.busy.load(Ordering::Acquire) {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "Capturer is busy: a frames() iterator is already active",
+            ));
+        }
+        let fmt = Fmt::parse(fmt).ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "unknown fmt {:?}, expected one of bgra/bgr/rgba/rgb/gray",
+                fmt
+            ))
+        })?;
+        let state = self
+            .state
+            .take()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Capturer is closed"))?;
+        let region = match region {
+            Some(t) => match Region::from_tuple(t, state.width, state.height) {
+                Ok(r) => r,
+                Err(e) => {
+                    self.state = Some(state);
+                    return Err(e.into());
+                }
+            },
+            None => self.region,
+        };
+        // Capture-thread runs unthrottled (target_fps=0) — the emit side does the pacing.
+        let opts = StartOpts { target_fps: 0, region, video_mode: false };
+        let handle = pacing::spawn(state, opts);
+        self.busy.store(true, Ordering::Release);
+        Ok(FramesIter::new(
+            handle,
+            self.busy.clone(),
+            fps,
+            fmt,
+            region,
+            Duration::from_millis(timeout_ms as u64),
         ))
     }
 
+    /// Zero-copy GPU mode. Returns a `GpuTexture` opaque handle, or None on timeout.
     #[pyo3(signature = (timeout_ms=1000))]
-    fn grab_gpu(&mut self, timeout_ms: u32) -> PyResult<()> {
-        let _ = timeout_ms;
-        Err(pyo3::exceptions::PyNotImplementedError::new_err(
-            "grab_gpu() lands in v0.0.2",
-        ))
+    fn grab_gpu(&mut self, py: Python<'_>, timeout_ms: u32) -> PyResult<Option<GpuTexture>> {
+        self.check_not_busy()?;
+        let state = self.state_mut()?;
+
+        // Lazily create the shared GPU producer texture.
+        if state.gpu.is_none() {
+            let prod = GpuProducerState::create(&state.device, state.width, state.height)?;
+            state.gpu = Some(prod);
+        }
+        let width = state.width;
+        let height = state.height;
+        let luid = state.adapter_luid;
+
+        let result: Option<usize> = py.detach(|| -> Result<Option<usize>, RustcamError> {
+            unsafe {
+                let s = self.state_unchecked_mut();
+                let got = s.try_acquire_into_capture(timeout_ms)?;
+                if !got {
+                    return Ok(None);
+                }
+                let prod = s.gpu.as_ref().unwrap();
+                let published = prod.copy_in(&s.context, &s.capture_tex, timeout_ms)?;
+                if !published {
+                    return Ok(None);
+                }
+                // Hand the consumer a private dup'd copy of the handle so
+                // they can close it independently of the producer.
+                let consumer_handle = prod.duplicate_handle_for_consumer()?;
+                Ok(Some(consumer_handle))
+            }
+        })?;
+
+        match result {
+            Some(handle) => Ok(Some(GpuTexture::new(handle, luid, width, height))),
+            None => Ok(None),
+        }
     }
 
     fn close(&mut self) {
+        if let Some(bg) = self.bg.take() {
+            let _ = bg.stop();
+        }
         self.state = None;
+        self.closed = true;
     }
 
     fn __enter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
@@ -453,6 +603,33 @@ impl Capturer {
 }
 
 impl Capturer {
+    fn check_open(&self) -> PyResult<()> {
+        if self.closed {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "Capturer is closed",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Returns the live CaptureState, lazily recreating the device if it was
+    /// consumed by a now-finished frames() iterator.
+    fn ensure_state(&mut self) -> PyResult<&mut CaptureState> {
+        self.check_open()?;
+        if self.state.is_none() && self.bg.is_none() {
+            let state = CaptureState::new(
+                self.device_idx,
+                self.output_idx,
+                self.cached_cursor,
+            )?;
+            self.state = Some(state);
+        }
+        self.state.as_mut().ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err("Capturer is in background mode")
+        })
+    }
+
+    #[allow(dead_code)]
     fn state(&self) -> PyResult<&CaptureState> {
         self.state
             .as_ref()
@@ -460,9 +637,7 @@ impl Capturer {
     }
 
     fn state_mut(&mut self) -> PyResult<&mut CaptureState> {
-        self.state
-            .as_mut()
-            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Capturer is closed"))
+        self.ensure_state()
     }
 
     /// Like state_mut but doesn't borrow self mutably (caller asserts they hold an exclusive ref
