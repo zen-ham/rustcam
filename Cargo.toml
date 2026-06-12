@@ -1,0 +1,47 @@
+[package]
+name         = "rustcam"
+version      = "0.0.2"
+edition      = "2021"
+rust-version = "1.83"
+description  = "Rust-backed Windows DXGI Desktop Duplication API screen capture for Python."
+license      = "MIT"
+authors      = ["zen-ham <again.really.plz@gmail.com>"]
+repository   = "https://github.com/zen-ham/rustcam"
+
+[lib]
+name        = "rustcam"
+crate-type  = ["cdylib", "rlib"]
+
+[dependencies]
+pyo3              = { version = "0.28", features = ["abi3-py39", "extension-module", "generate-import-lib"] }
+numpy             = "0.28"
+parking_lot       = "0.12"
+crossbeam-channel = "0.5"
+once_cell         = "1"
+
+[dependencies.windows]
+version  = "0.62"
+features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_System_Threading",
+    "Win32_System_LibraryLoader",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_HiDpi",
+    "Win32_UI_WindowsAndMessaging",
+]
+
+[profile.release]
+opt-level     = 3
+lto           = "fat"
+codegen-units = 1
+strip         = "symbols"
+panic         = "abort"
+
+[profile.dev]
+opt-level = 1
+debug     = "line-tables-only"
