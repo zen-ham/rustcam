@@ -41,11 +41,14 @@ pub(crate) struct Frame {
     pub captured_at: Instant,
 }
 
-/// One-slot mailbox + frame buffer protected by its own mutex (so we don't
-/// clone the buffer under the Frame metadata lock).
+/// One-slot mailbox. The buffer is stored as `Arc<Vec<u8>>` so that the
+/// capture thread can keep a cheap clone of the latest frame (for video_mode
+/// re-publish) and the consumer can take ownership of the Arc without
+/// copying 8 MB of BGRA. Whoever has a strong ref last (usually the
+/// consumer) gets to consume the buffer via Arc::try_unwrap; otherwise we
+/// copy at the API boundary.
 pub(crate) struct Mailbox {
-    /// Latest payload (Vec<u8> in BGRA from the captured rect).
-    pub buf: Mutex<Option<(Frame, Vec<u8>)>>,
+    pub buf: Mutex<Option<(Frame, Arc<Vec<u8>>)>>,
     pub cv: Condvar,
     pub error: Mutex<Option<PyErr>>,
     pub stop: AtomicBool,
@@ -115,7 +118,7 @@ pub fn spawn(state: CaptureState, opts: StartOpts) -> BackgroundHandle {
 
 fn capture_loop(state: &mut CaptureState, mb: &Arc<Mailbox>, opts: StartOpts) {
     let mut seq: u64 = 0;
-    let mut last_buf: Option<Vec<u8>> = None;
+    let mut last_arc: Option<Arc<Vec<u8>>> = None;
     let period = if opts.target_fps > 0 {
         Some(Duration::from_nanos(1_000_000_000u64 / opts.target_fps as u64))
     } else {
@@ -139,7 +142,7 @@ fn capture_loop(state: &mut CaptureState, mb: &Arc<Mailbox>, opts: StartOpts) {
             }
         };
 
-        let mut new_buf: Option<Vec<u8>> = None;
+        let mut new_arc: Option<Arc<Vec<u8>>> = None;
         if got {
             let map_result = unsafe { state.map_staging() };
             match map_result {
@@ -156,7 +159,7 @@ fn capture_loop(state: &mut CaptureState, mb: &Arc<Mailbox>, opts: StartOpts) {
                         );
                         state.unmap_staging();
                     }
-                    new_buf = Some(buf);
+                    new_arc = Some(Arc::new(buf));
                 }
                 Err(e) => {
                     let mut err = mb.error.lock();
@@ -167,27 +170,26 @@ fn capture_loop(state: &mut CaptureState, mb: &Arc<Mailbox>, opts: StartOpts) {
         }
 
         // Publish: new frame, OR if video_mode + we already have a previous
-        // frame, re-publish that one so the consumer's mailbox always has the
-        // latest content at the cadence target_fps demands.
-        let to_publish = if new_buf.is_some() {
-            new_buf.as_ref()
+        // frame, re-publish that one (an Arc clone, just a refcount bump).
+        let to_publish: Option<Arc<Vec<u8>>> = if let Some(arc) = new_arc.as_ref() {
+            Some(arc.clone())
         } else if opts.video_mode {
-            last_buf.as_ref()
+            last_arc.clone()
         } else {
             None
         };
 
-        if let Some(buf) = to_publish {
+        if let Some(arc) = to_publish {
             seq += 1;
             let frame = Frame {
                 seq,
                 captured_at: Instant::now(),
             };
             let mut slot = mb.buf.lock();
-            *slot = Some((frame, buf.clone()));
+            *slot = Some((frame, arc));
             mb.cv.notify_all();
-            if let Some(nb) = new_buf {
-                last_buf = Some(nb);
+            if let Some(nb) = new_arc {
+                last_arc = Some(nb);
             }
         }
 
@@ -210,7 +212,7 @@ fn capture_loop(state: &mut CaptureState, mb: &Arc<Mailbox>, opts: StartOpts) {
 pub fn get_latest(
     mb: &Arc<Mailbox>,
     timeout: Option<Duration>,
-) -> Result<Option<(Frame, Vec<u8>)>, RustcamError> {
+) -> Result<Option<(Frame, Arc<Vec<u8>>)>, RustcamError> {
     let mut slot = mb.buf.lock();
     let deadline = timeout.map(|d| Instant::now() + d);
 
@@ -238,6 +240,12 @@ pub fn get_latest(
     Ok(slot.take())
 }
 
+/// Convert an Arc<Vec<u8>> back into an owned Vec. If we hold the only strong
+/// ref, unwrap is zero-copy; otherwise we clone the Vec.
+pub fn arc_into_vec(arc: Arc<Vec<u8>>) -> Vec<u8> {
+    Arc::try_unwrap(arc).unwrap_or_else(|a| (*a).clone())
+}
+
 /// Peek without consuming. Used by the CFR pacer.
 pub fn peek_seq(mb: &Arc<Mailbox>) -> Option<u64> {
     mb.buf.lock().as_ref().map(|(f, _)| f.seq)
@@ -247,7 +255,7 @@ pub fn peek_seq(mb: &Arc<Mailbox>) -> Option<u64> {
 pub fn take_if_newer(
     mb: &Arc<Mailbox>,
     since_seq: u64,
-) -> Option<(Frame, Vec<u8>)> {
+) -> Option<(Frame, Arc<Vec<u8>>)> {
     let mut slot = mb.buf.lock();
     let take = slot.as_ref().is_some_and(|(f, _)| f.seq > since_seq);
     if take {
@@ -278,7 +286,7 @@ pub struct FramesIter {
     /// What seq we last emitted (for detecting fresh frames)
     last_seq: u64,
     /// Cache of the last emitted BGRA buffer (for duplicate slots)
-    last_buf: Option<Vec<u8>>,
+    last_buf: Option<Arc<Vec<u8>>>,
     /// Per-slot wait deadline (timeout_ms in the public API)
     slot_timeout: Duration,
     /// Whether we've handed back the parent's CaptureState yet.
@@ -358,7 +366,7 @@ impl FramesIter {
 
         // Drain mailbox: prefer a fresh frame, else dup the last we emitted.
         // Wait up to slot_timeout for the first frame.
-        let fresh = py.detach(|| -> Result<Option<(Frame, Vec<u8>)>, RustcamError> {
+        let fresh = py.detach(|| -> Result<Option<(Frame, Arc<Vec<u8>>)>, RustcamError> {
             // If first slot and no frame yet, wait up to slot_timeout.
             if self.last_buf.is_none() {
                 return get_latest(&self.mailbox, Some(self.slot_timeout));
@@ -370,12 +378,10 @@ impl FramesIter {
             (Some((f, b)), _) => {
                 self.last_seq = f.seq;
                 self.last_buf = Some(b.clone());
-                b
+                arc_into_vec(b)
             }
-            (None, Some(prev)) => prev.clone(),
+            (None, Some(prev)) => (**prev).clone(),
             (None, None) => {
-                // Should not happen: get_latest above raises CaptureTimeout
-                // if first frame never arrives.
                 return Err(CaptureTimeout::new_err(
                     "frames() iteration produced no frames",
                 ));

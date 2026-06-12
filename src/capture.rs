@@ -460,7 +460,7 @@ impl Capturer {
 
         let took = py.detach(|| pacing::get_latest(&mb, to))?;
         let buf = match took {
-            Some((_, b)) => b,
+            Some((_, b)) => pacing::arc_into_vec(b),
             None => return Ok(None),
         };
         let arr = buf.into_pyarray(py);
