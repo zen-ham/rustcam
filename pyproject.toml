@@ -8,6 +8,7 @@ description     = "Rust-backed Windows DXGI Desktop Duplication API screen captu
 readme          = "README.md"
 requires-python = ">=3.9"
 license         = { text = "MIT" }
+license-files   = []
 authors         = [{ name = "zen-ham" }]
 keywords        = ["screen-capture", "dda", "dxgi", "windows", "directx", "screenshot", "bettercam"]
 classifiers     = [
