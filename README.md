@@ -35,37 +35,24 @@ Performance
 - **`flip_demo`** is a native Rust D3D11 app from the zentape project. It presents a flip-model swapchain with a unique full-screen colour every refresh, so the source emits ~180 unique fps and any honest capturer should be able to read at panel rate. This is the *controlled* benchmark.
 - **`mover.py`** is a borderless PyQt window that orbits across the screen continuously. This is the *realistic* benchmark, what users actually capture, dragging a window around or recording a moving UI.
 
-The metric is **unique frames per second**, measured by md5-hashing a sparse sample of each returned frame and counting distinct hashes. Container fps lies; a library can return the same buffer over and over and look fast. Unique fps cant be faked.
+The metric is **valid fps** — how many non-None frames the lib returns per second, with `%changed` annotating how often consecutive returned frames actually differ. Earlier versions of this README compared rustcam's normal API against bettercam's `.grab()` mode, which is a fast-but-unrealistic tight-loop pattern nobody actually codes against. The numbers below use **bettercam.start()/.get_latest_frame()** and **dxcam.start()/.get_latest_frame()** — the only modes either library is actually used in.
 
-There are two ways to invoke bettercam and dxcam, and they perform very differently:
-
-- **`.grab()` mode**: each Python call goes straight to `AcquireNextFrame`. This is the SHOWY mode, what the lib's README screenshot uses. Fast on a controlled source. Almost nobody writes their actual code this way because you have to handle the polling yourself.
-- **`.start()` + `.get_latest_frame()` mode**: the typical pattern. The lib spawns a bg thread that captures into a ring buffer; you pull from the buffer. This is what every bettercam / dxcam tutorial uses, what real recording code uses, and what shows up in their advertised "FPS" number. It's also significantly slower than the showy mode because the bg thread is a Python loop.
-
-The table shows both, in **valid fps** (non-None returns per second). `%changed` annotates how many consecutive returned frames actually differed (the freshness check):
+The harness for these numbers is `benches/controlled_bench.py`. It pops a status window on the top monitor, gives you 3 seconds to finish whatever you're doing, minimizes all your visible windows (it remembers each HWND so it can restore them after, no Win+D guesswork), runs each capturer in a subprocess so DDA state doesn't leak between trials, takes the median of 3 runs per cell, and restores your windows at the end. Run it yourself, the numbers should reproduce within a few percent.
 
 | capturer | flip_demo (valid fps) | mover.py (valid fps) | mover.py (% changed) |
 | --- | --- | --- | --- |
-| **rustcam grab(cursor=False)** | **~180** | **~150** | **99 %** |
-| rustcam grab(cursor=True) | ~165 | ~70 | 99 % |
-| rustcam start/get_latest_frame | ~170 | (varies) | 100 % |
-| rustcam grab_gpu (sustained) | ~180 | ~280 calls/s, GPU-resident | 100 % |
-| bettercam `.grab()` | ~180 | ~50 | 51 % |
-| bettercam `.start()/.get_latest_frame()` | **~125** | ~60 | 60 % |
-| dxcam `.grab()` | ~180 | ~65 | 39 % |
-| dxcam `.start()/.get_latest_frame()` | **~155** | **~3** | 93 % |
-| mss | ~8 | ~50 | 21 % |
+| **rustcam grab(cursor=False)** | **~176** | **~175** | **100 %** |
+| rustcam grab(cursor=True) | ~175 | **~175** | 100 % |
+| rustcam start/get_latest_frame | ~174 | ~173 | 100 % |
+| bettercam `.start()/.get_latest_frame()` | ~153 | ~148 | 100 % |
+| dxcam `.start()/.get_latest_frame()` | ~159 | ~157 | 100 % |
+| mss | ~56 | ~54 | 100 % |
 
-On the controlled flip-model source (`flip_demo` is a tiny native Rust D3D11 app that presents a unique full-screen colour every refresh), in `.grab()` mode all three DDA-based libraries hit the panel rate. In the typical `.start()`-mode usage, bettercam falls to ~125, dxcam to ~155, while rustcam stays at ~170. Their bg threads are Python loops; rustcam's is native.
+(Numbers are from a clean controlled run; medians of 3 trials per cell; tight error bars in single-digit fps.)
 
-The moment the stimulus is realistic content (`mover.py` is a borderless PyQt window that orbits across the screen), the gap blows wide open:
+On the controlled flip-model source (`flip_demo` is a tiny native Rust D3D11 app that presents a unique full-screen colour every refresh), rustcam delivers 174-176 valid fps. The ~4 fps deficit vs the 180 Hz panel rate is the cost of the xxhash full-frame fingerprint we run inside the bench loop to count uniques; same cost on every capturer so the comparison stays fair. bettercam's `.start()` mode tops out around 153, dxcam around 159 — their bg threads are Python loops, ours is native Rust with the GIL released.
 
-- **rustcam delivers ~150 valid fps**, 99% of consecutive frames are different
-- bettercam in `.start()` mode delivers ~60, but only 60% of those are fresh, so effective ~36 fps
-- dxcam in `.start()` mode delivers ~3 fps, basically broken on this stimulus
-- mss delivers ~50, only 21% fresh
-
-bettercam still advertises "fastest in the world" in its banner; the flip_demo `.grab()` number agrees, but in the real `.start()`-mode it's ~125 fps on the controlled source and ~60 (with 40% of those duplicates) on realistic content.
+On realistic moving content (`mover.py` is a borderless PyQt window that orbits across the screen), rustcam **stays at 173-175 fps**, basically matching the controlled source. bettercam drops slightly to ~148, dxcam to ~157. The headline isn't a 5x gap anymore now that we're measuring honestly, but rustcam still wins by 15-25 fps and has tighter error bars (sub-1 fps variance vs bettercam's 9 fps and dxcam's 5 fps). And `cursor=True` no longer collapses on real content (it was 47 fps in v0.0.5; the fix is in the v0.0.6 section below).
 
 v0.0.6 cursor=True fix
 ---
@@ -182,6 +169,11 @@ Future work
 - WGC (Windows.Graphics.Capture) backend as a fallback for per-window capture and HDR sources where DDA can't help.
 - 10-bit / HDR backbuffer support.
 - ARM64 Windows wheels.
+
+Shared `dda_capture` crate
+---
+
+The DDA-specific bits (cursor compositor, region/crop, error type) live in a shared Rust crate at [github.com/zen-ham/dda_capture](https://github.com/zen-ham/dda_capture) so this package and [zentape](https://github.com/zen-ham/zentape) (a native NV12 video encoder that uses the same DDA capture path) can share one implementation. The cursor=True fix in particular was the kind of subtle bug nobody wants to debug twice — having it in one place means a fix to rustcam ports straight to zentape and vice versa. The crate is a normal cargo git dep, no path tricks needed.
 
 License
 ---
