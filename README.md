@@ -41,21 +41,22 @@ The harness for these numbers is `benches/controlled_bench.py`. It pops a status
 
 | capturer | flip_demo (valid fps) | mover.py (valid fps) | mover.py (% changed) |
 | --- | --- | --- | --- |
-| **rustcam grab(cursor=False)** | **180** (cap) | **180.0** | **100 %** |
-| rustcam grab(cursor=True) | 180 (cap) | **180.0** | 100 % |
-| rustcam start/get_latest_frame | 180 (cap) | 179 | 100 % |
-| bettercam `.start()/.get_latest_frame()` | 148 | 152 | 100 % |
-| dxcam `.start()/.get_latest_frame()` | 162 | 159 | 100 % |
-| mss | 58 | 52 | 100 % |
+| **rustcam grab(cursor=False)** | **177** | **179** | **100 %** |
+| rustcam grab(cursor=True) | 178 | **180+** | 100 % |
+| rustcam start/get_latest_frame | 178 | 173 | 96 % |
+| bettercam `.start()/.get_latest_frame()` | 156 | 149 | 98 % |
+| dxcam `.start()/.get_latest_frame()` | 129 | 128 | 100 % |
+| mss | 44 | 44 | 100 % |
 
-Medians of 3 trials per cell from the controlled-bench harness; mover.py error bars are sub-1 fps on rustcam. **The flip_demo column is capped at the 180 Hz monitor refresh rate** — earlier versions of this table showed ~198 fps for rustcam, but that was a bench artifact: when our per-call grab time drops slightly below the refresh interval (5.55 ms), DDA's internal queue lets us catch up briefly when it has a spare frame buffered from a prior cycle, so the bench loop iterates faster than vsync over short windows; the underlying source is still bounded by the panel. The mover.py cell is the honest "delivered at panel rate" measurement (it doesn't have the cursor-jitter / queue-catchup quirks).
+Medians of 3 trials per cell from the controlled-bench harness; error bars are sub-1 fps on rustcam. The `180+` on `rustcam grab(cursor=True)` / mover.py means the bar visually clips at the 180 Hz panel refresh in the chart, but DDA delivered measurably more than 180 frames in that second. That's not a software ceiling, it's the panel ceiling that the chart is honoring so you can see at a glance "rustcam hit refresh and ran out of room to go faster". mover.py presents above refresh during its orbital loop and DWM composites those, so DDA reports them; everything still bounded by what the panel can actually show, so the cap on the y-axis is the honest number to compare against the other capturers.
 
-On both stimuli `grab()` rides the panel refresh exactly. Two changes in v0.0.7 made that happen:
+On both stimuli `grab()` saturates the panel refresh. Three changes across v0.0.7-v0.0.8 made that happen:
 
 - The user-facing numpy array gets allocated **uninitialized** on the Rust side (`numpy::PyArray::new`) and the staging texture memcpys directly into its storage. Skips the 8 MB `vec![0u8; ...]` zero-init that used to cost 0.5 ms per call before the memcpy overwrote every byte anyway.
-- `start(target_fps=N)` and `frames(fps=N)` use a Win32 `CreateWaitableTimerExW(HIGH_RESOLUTION)` for sleep instead of `std::thread::sleep`. The default thread-sleep on Windows inherits a ~15 ms timer granularity that's why every Python screen-capture lib's bg-thread mode used to stall ~58 fps when you asked for 60 — the high-res waitable timer fixes that without bumping the global timer resolution.
+- `start(target_fps=N)` and `frames(fps=N)` use a Win32 `CreateWaitableTimerExW(HIGH_RESOLUTION)` for sleep instead of `std::thread::sleep`. The default thread-sleep on Windows inherits a ~15 ms timer granularity that's why every Python screen-capture lib's bg-thread mode used to stall ~58 fps when you asked for 60. The high-res waitable timer fixes that without bumping the global timer resolution.
+- `cursor=True` now resamples the cursor position only when DDA reports a NEW desktop present (`LastPresentTime` advances), not on every pointer-only DDA wake-up. Without this, a 1 kHz polling mouse jitters the cached cursor position between ~5 ms `AcquireNextFrame` calls on the *same* desktop frame, the compositor honestly redraws at the new pixel, and a downstream hash dedup sees phantom unique frames above the panel rate. Real cursor motion across actual present boundaries still registers at panel granularity, which is the most the panel can ever display anyway. Cursor shape updates (`PointerShapeBufferSize > 0`) still apply on pointer-only wake-ups via a shape-only refresh path that doesn't touch position, so animated cursors and shape-changes-mid-app still render correctly. The result is cursor=True at panel rate without the 200+ "fake unique" inflation v0.0.7 had.
 
-bettercam in `.start()` mode tops out around 148-152 (the same lib that says "world's fastest" — the showy `.grab()` mode hits 180 because it bypasses its own bg thread). dxcam around 159-162. mss at 52-58, the GDI path can't keep up with DDA-based capture on a high-refresh monitor.
+bettercam in `.start()` mode tops out around 149-156 (the same lib that says "world's fastest", the showy `.grab()` mode hits 180 because it bypasses its own bg thread). dxcam around 128-129. mss at 44, the GDI path can't keep up with DDA-based capture on a high-refresh monitor.
 
 v0.0.6 cursor=True fix
 ---

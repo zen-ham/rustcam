@@ -65,6 +65,15 @@ pub struct CaptureState {
     pub rotation: u32,
     pub cursor: bool,
     pub cursor_state: CursorState,
+    /// `LastPresentTime` of the most recent acquire that we treated as a "new
+    /// desktop present" (a real frame, not a pointer-only DDA wake-up). Used to
+    /// gate `cursor_state` resampling: without this, a high-poll-rate mouse
+    /// moves the cursor by 1+ integer pixel between consecutive ~5 ms acquires
+    /// on the SAME desktop frame, the compositor faithfully redraws at the new
+    /// position, and the output bytes differ — producing phantom "unique"
+    /// frames above the panel refresh rate. Sampling the cursor only when
+    /// `LastPresentTime` advances aligns cursor frequency to panel refresh.
+    pub last_present_time: i64,
     pub adapter_luid: (u32, i32),
     /// Lazy GPU-shared producer state for `grab_gpu()`.
     pub gpu: Option<GpuProducerState>,
@@ -176,6 +185,7 @@ impl CaptureState {
                 rotation,
                 cursor,
                 cursor_state: CursorState::default(),
+                last_present_time: 0,
                 adapter_luid,
                 gpu: None,
                 scratch_bgra: vec![0u8; (width as usize) * (height as usize) * 4],
@@ -210,13 +220,34 @@ impl CaptureState {
                 // (position) or PointerShapeBufferSize > 0 (shape change), so
                 // the cached state survives across frames where nothing
                 // changed.
+                //
+                // CRITICAL: DXGI's AcquireNextFrame fires on TWO events — a
+                // new desktop present, OR a pointer-only update (mouse moved,
+                // screen didn't change). We only want to resample the cursor
+                // position when a real present landed; otherwise a high-poll-
+                // rate mouse jitters the composited output bytes between
+                // identical desktop frames and the consumer (e.g. a hash
+                // dedup) sees phantom unique frames above the panel rate.
+                // Shape updates can still piggyback on a pointer-only wake-up,
+                // and we DO want a fresh shape cache for the next real
+                // present, so we refresh shape-only in that case via
+                // `refresh_shape_only` (which does not touch position).
                 if self.cursor {
-                    let _ = self.cursor_state.update_from_frame(
-                        &self.dup,
-                        fi.LastMouseUpdateTime,
-                        &fi.PointerPosition,
-                        fi.PointerShapeBufferSize,
-                    );
+                    let present_advanced =
+                        fi.LastPresentTime != 0 && fi.LastPresentTime != self.last_present_time;
+                    if present_advanced {
+                        let _ = self.cursor_state.update_from_frame(
+                            &self.dup,
+                            fi.LastMouseUpdateTime,
+                            &fi.PointerPosition,
+                            fi.PointerShapeBufferSize,
+                        );
+                        self.last_present_time = fi.LastPresentTime;
+                    } else if fi.PointerShapeBufferSize > 0 {
+                        let _ = self
+                            .cursor_state
+                            .refresh_shape_only(&self.dup, fi.PointerShapeBufferSize);
+                    }
                 }
                 let _ = self.dup.ReleaseFrame();
                 Ok(true)
