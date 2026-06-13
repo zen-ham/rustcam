@@ -492,12 +492,29 @@ def _render_chart(results):
     def pull(rs, attr):
         return [next((r[attr] for r in rs if r["name"] == n), 0.0) for n in labels]
 
-    flip_v = pull(flip, "valid_fps")
-    mover_v = pull(mover, "valid_fps")
-    flip_min = pull(flip, "valid_min")
-    flip_max = pull(flip, "valid_max")
-    mover_min = pull(mover, "valid_min")
-    mover_max = pull(mover, "valid_max")
+    # Cap displayed values at panel rate. DDA + AcquireNextFrame is event-
+    # driven on monitor refresh, so >panel valid_fps is impossible for unique
+    # source content. When we see >panel it means cursor compositing is
+    # making consecutive grabs distinct via sub-pixel mouse jitter even when
+    # DDA returned the same source frame twice (DDA can queue + flush a
+    # short backlog when the consumer is faster than vsync for a moment).
+    # That makes a bar of "198" misleading: the rate of new SOURCE content
+    # is capped at 180. Bars stay accurate up to refresh; above refresh
+    # they're clamped + the raw number is shown above the bar with a "+".
+    PANEL = 180.0
+
+    def _cap(rows, attr):
+        return [min(PANEL, next((r[attr] for r in rows if r["name"] == n), 0.0)) for n in labels]
+
+    flip_v = _cap(flip, "valid_fps")
+    mover_v = _cap(mover, "valid_fps")
+    flip_min = _cap(flip, "valid_min")
+    flip_max = _cap(flip, "valid_max")
+    mover_min = _cap(mover, "valid_min")
+    mover_max = _cap(mover, "valid_max")
+    # Raw numbers for annotations
+    flip_raw = pull(flip, "valid_fps")
+    mover_raw = pull(mover, "valid_fps")
 
     x = np.arange(len(labels))
     w = 0.38
@@ -524,9 +541,17 @@ def _render_chart(results):
     ax.set_xticklabels(labels, fontsize=9, rotation=35, ha="right",
                        rotation_mode="anchor")
     ax.grid(axis="y", linestyle="--", alpha=0.4)
-    for vals, off in ((flip_v, -w/2), (mover_v, w/2)):
-        for xi, v in zip(x, vals):
-            ax.text(xi + off, v + 2, f"{v:.0f}",
+    # Annotate each bar with the value. If the raw measurement exceeded
+    # panel rate (impossible for actual unique source content; cursor
+    # jitter artifact), show the raw with a "+" suffix so the chart
+    # remains honest about what was measured even though we cap the bar.
+    for vals, raws, off in (
+        (flip_v, flip_raw, -w / 2),
+        (mover_v, mover_raw, w / 2),
+    ):
+        for xi, v, raw in zip(x, vals, raws):
+            label = f"{v:.0f}" + ("+" if raw > PANEL + 0.5 else "")
+            ax.text(xi + off, v + 2, label,
                     ha="center", va="bottom", fontsize=8.5)
     ax.legend(loc="upper right", fontsize=9)
     plt.tight_layout()

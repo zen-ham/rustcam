@@ -41,14 +41,14 @@ The harness for these numbers is `benches/controlled_bench.py`. It pops a status
 
 | capturer | flip_demo (valid fps) | mover.py (valid fps) | mover.py (% changed) |
 | --- | --- | --- | --- |
-| **rustcam grab(cursor=False)** | **198** | **180.0** | **100 %** |
-| rustcam grab(cursor=True) | 198 | **180.0** | 100 % |
-| rustcam start/get_latest_frame | 181 | 179 | 100 % |
+| **rustcam grab(cursor=False)** | **180** (cap) | **180.0** | **100 %** |
+| rustcam grab(cursor=True) | 180 (cap) | **180.0** | 100 % |
+| rustcam start/get_latest_frame | 180 (cap) | 179 | 100 % |
 | bettercam `.start()/.get_latest_frame()` | 148 | 152 | 100 % |
 | dxcam `.start()/.get_latest_frame()` | 162 | 159 | 100 % |
 | mss | 58 | 52 | 100 % |
 
-(Medians of 3 trials per cell from the controlled-bench harness; mover.py error bars are sub-1 fps on rustcam. The flip_demo number for `grab()` runs slightly above the 180 Hz panel rate because flip_demo's actual vsync interval and the bench's fingerprinting clock occasionally overlap such that a stale buffer slips past the "valid" check; mover.py's clean 180.0 is the honest "exactly at refresh" number.)
+Medians of 3 trials per cell from the controlled-bench harness; mover.py error bars are sub-1 fps on rustcam. **The flip_demo column is capped at the 180 Hz monitor refresh rate** — earlier versions of this table showed ~198 fps for rustcam, but that was a bench artifact: when our per-call grab time drops slightly below the refresh interval (5.55 ms), DDA's internal queue lets us catch up briefly when it has a spare frame buffered from a prior cycle, so the bench loop iterates faster than vsync over short windows; the underlying source is still bounded by the panel. The mover.py cell is the honest "delivered at panel rate" measurement (it doesn't have the cursor-jitter / queue-catchup quirks).
 
 On both stimuli `grab()` rides the panel refresh exactly. Two changes in v0.0.7 made that happen:
 
