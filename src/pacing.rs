@@ -26,6 +26,7 @@ use pyo3::prelude::*;
 
 use crate::capture::CaptureState;
 use crate::convert::{bgra_to, Fmt};
+use crate::cursor::composite_cursor_into_bgra;
 use crate::errors::{CaptureTimeout, RustcamError};
 use crate::region::{crop_copy_bgra, Region};
 
@@ -158,6 +159,17 @@ fn capture_loop(state: &mut CaptureState, mb: &Arc<Mailbox>, opts: StartOpts) {
                             region,
                         );
                         state.unmap_staging();
+                    }
+                    // Cursor composite (same software path used by grab()).
+                    if state.cursor {
+                        composite_cursor_into_bgra(
+                            &mut buf,
+                            region.width(),
+                            region.height(),
+                            region.left as i32,
+                            region.top as i32,
+                            &state.cursor_state,
+                        );
                     }
                     new_arc = Some(Arc::new(buf));
                 }

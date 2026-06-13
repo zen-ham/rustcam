@@ -15,7 +15,7 @@ use windows::Win32::Graphics::Direct3D11::{
     D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D,
     D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_CPU_ACCESS_READ,
     D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ,
-    D3D11_RESOURCE_MISC_GDI_COMPATIBLE, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC,
+    D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC,
     D3D11_USAGE_DEFAULT, D3D11_USAGE_STAGING,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
@@ -31,7 +31,7 @@ use windows::Win32::UI::HiDpi::{
 };
 
 use crate::convert::{bgra_to, Fmt};
-use crate::cursor::{draw_cursor, CursorCache};
+use crate::cursor::{composite_cursor_into_bgra, CursorState};
 use crate::errors::{map_dxgi, RustcamError};
 use crate::gpu::{GpuProducerState, GpuTexture};
 use crate::pacing::{self, BackgroundHandle, FramesIter, StartOpts};
@@ -64,7 +64,7 @@ pub struct CaptureState {
     pub height: u32,
     pub rotation: u32,
     pub cursor: bool,
-    pub cursor_cache: CursorCache,
+    pub cursor_state: CursorState,
     pub adapter_luid: (u32, i32),
     /// Lazy GPU-shared producer state for `grab_gpu()`.
     pub gpu: Option<GpuProducerState>,
@@ -130,6 +130,9 @@ impl CaptureState {
             let rotation = dup_desc.Rotation.0 as u32;
 
             let mut capture_tex: Option<ID3D11Texture2D> = None;
+            // No MISC_GDI_COMPATIBLE: we no longer go through GDI's GetDC for
+            // cursor compositing. Cursor is composited in software on the
+            // mapped staging buffer in `grab()` (see cursor.rs).
             let capture_desc = D3D11_TEXTURE2D_DESC {
                 Width: width,
                 Height: height,
@@ -140,11 +143,7 @@ impl CaptureState {
                 Usage: D3D11_USAGE_DEFAULT,
                 BindFlags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
                 CPUAccessFlags: 0,
-                MiscFlags: if cursor {
-                    D3D11_RESOURCE_MISC_GDI_COMPATIBLE.0 as u32
-                } else {
-                    0
-                },
+                MiscFlags: 0,
             };
             device.CreateTexture2D(&capture_desc, None, Some(&mut capture_tex))?;
             let capture_tex = capture_tex.unwrap();
@@ -171,7 +170,7 @@ impl CaptureState {
                 height,
                 rotation,
                 cursor,
-                cursor_cache: CursorCache::new(),
+                cursor_state: CursorState::default(),
                 adapter_luid,
                 gpu: None,
             };
@@ -200,10 +199,20 @@ impl CaptureState {
                         self.context.CopyResource(&self.capture_tex, &frame_tex);
                     }
                 }
-                let _ = self.dup.ReleaseFrame();
+                // Pull cursor position + shape from DDA before releasing the
+                // frame. DDA only fills these when LastMouseUpdateTime != 0
+                // (position) or PointerShapeBufferSize > 0 (shape change), so
+                // the cached state survives across frames where nothing
+                // changed.
                 if self.cursor {
-                    draw_cursor(&self.capture_tex, &mut self.cursor_cache);
+                    let _ = self.cursor_state.update_from_frame(
+                        &self.dup,
+                        fi.LastMouseUpdateTime,
+                        &fi.PointerPosition,
+                        fi.PointerShapeBufferSize,
+                    );
                 }
+                let _ = self.dup.ReleaseFrame();
                 Ok(true)
             }
             Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT => Ok(false),
@@ -333,6 +342,33 @@ impl Capturer {
         self.bg.is_some() || self.busy.load(Ordering::Acquire)
     }
 
+    /// DEBUG: read the current cursor state (visibility, position, shape kind).
+    /// Returns a dict so we can inspect what DDA has told us so far.
+    fn _debug_cursor<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        use pyo3::types::PyDict;
+        let d = PyDict::new(py);
+        if let Some(s) = self.state.as_ref() {
+            d.set_item("visible", s.cursor_state.visible)?;
+            d.set_item("pos_x", s.cursor_state.pos_x)?;
+            d.set_item("pos_y", s.cursor_state.pos_y)?;
+            match &s.cursor_state.shape {
+                Some(shape) => {
+                    d.set_item("shape_kind", shape.kind)?;
+                    d.set_item("shape_w", shape.width)?;
+                    d.set_item("shape_h", shape.height)?;
+                    d.set_item("shape_pitch", shape.pitch)?;
+                    d.set_item("hotspot_x", shape.hotspot_x)?;
+                    d.set_item("hotspot_y", shape.hotspot_y)?;
+                    d.set_item("buf_len", shape.pixels.len())?;
+                }
+                None => {
+                    d.set_item("shape", py.None())?;
+                }
+            }
+        }
+        Ok(d.into_any())
+    }
+
     /// One-shot capture. Returns a (H, W, C) uint8 ndarray, or None on WAIT_TIMEOUT.
     #[pyo3(signature = (timeout_ms=1000, fmt="bgra", region=None))]
     fn grab<'py>(
@@ -369,6 +405,20 @@ impl Capturer {
                 let mut buf = vec![0u8; w * h * 4];
                 crop_copy_bgra(&mut buf, m.pData as *const u8, m.RowPitch as usize, region);
                 self.state_unchecked_mut().unmap_staging();
+                // Software cursor composite into the BGRA buffer. No GDI,
+                // no GPU sync barrier. Cursor position + shape were updated
+                // from DDA's frame info inside try_acquire_into_capture.
+                let s = self.state_unchecked_mut();
+                if s.cursor {
+                    composite_cursor_into_bgra(
+                        &mut buf,
+                        region.width(),
+                        region.height(),
+                        region.left as i32,
+                        region.top as i32,
+                        &s.cursor_state,
+                    );
+                }
                 Ok(Some(buf))
             }
         })?;

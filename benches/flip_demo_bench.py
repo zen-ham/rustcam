@@ -30,8 +30,27 @@ ROOT = os.path.dirname(HERE)
 FLIP_DEMO = os.path.join(ROOT, "perf_lab", "flip_demo.exe")
 MOVER = os.path.join(ROOT, "perf_lab", "mover.py")
 
-DURATION_S = 4.0
+DURATION_S = 3.0
 WARMUP_S = 0.5
+REPEATS = 3  # number of timed runs per capturer; we take the median
+
+# Capturers and the keys understood by _runner.py
+CAPTURERS = [
+    "rustcam_nocursor",
+    "rustcam_cursor",
+    "rustcam_bg",
+    "rustcam_gpu",
+    "bettercam_grab",
+    "bettercam_start",
+    "dxcam_grab",
+    "dxcam_start",
+    "mss",
+]
+
+# Per-capturer wall-clock budget incl. startup + warmup + REPEATS runs.
+# REPEATS * DURATION_S + warmup + ~1s python start + ~1s teardown
+PER_CAP_SECS = REPEATS * DURATION_S + WARMUP_S + 3.0
+ROUND_BUDGET = PER_CAP_SECS * len(CAPTURERS) + 8.0
 
 
 def start_flip_demo():
@@ -56,9 +75,10 @@ def start_flip_demo():
     return p
 
 
-def start_mover(secs):
+def start_mover(secs=None):
     if not os.path.exists(MOVER):
         return None
+    secs = secs if secs is not None else ROUND_BUDGET
     p = subprocess.Popen(
         [sys.executable, MOVER, str(secs)],
         stdout=subprocess.DEVNULL,
@@ -110,15 +130,14 @@ def fingerprint(arr):
     return h.digest()
 
 
-def bench(name, capture_fn, duration_s=DURATION_S, warmup_s=WARMUP_S):
-    """capture_fn: () -> ndarray | None. Returns dict with the metrics."""
+def _single_run(capture_fn, duration_s, warmup_s):
+    """One timed sweep. Returns the metric dict for this single run."""
     # warmup
     t0 = time.perf_counter()
     while time.perf_counter() - t0 < warmup_s:
         capture_fn()
 
     seen = set()
-    fps_chain = []
     valid = 0
     calls = 0
     last_fp = None
@@ -139,24 +158,39 @@ def bench(name, capture_fn, duration_s=DURATION_S, warmup_s=WARMUP_S):
                 changed += 1
         last_fp = fp
     elapsed = time.perf_counter() - t0
-    unique_fps = len(seen) / elapsed
-    valid_fps = valid / elapsed
-    call_fps = calls / elapsed
-    pct_changed = 100.0 * changed / valid_minus_1 if valid_minus_1 else 0.0
-    print(
-        f"  {name:<28} unique={unique_fps:6.1f}fps  "
-        f"valid={valid_fps:6.1f}fps  calls={call_fps:6.1f}fps  "
-        f"%changed={pct_changed:5.1f}%   ({len(seen)} uniques)"
-    )
     return dict(
-        name=name,
-        unique_fps=unique_fps,
-        valid_fps=valid_fps,
-        call_fps=call_fps,
-        pct_changed=pct_changed,
+        unique_fps=len(seen) / elapsed,
+        valid_fps=valid / elapsed,
+        call_fps=calls / elapsed,
+        pct_changed=(100.0 * changed / valid_minus_1) if valid_minus_1 else 0.0,
         uniques=len(seen),
         duration_s=elapsed,
     )
+
+
+def bench(name, capture_fn, duration_s=DURATION_S, warmup_s=WARMUP_S, repeats=REPEATS):
+    """Run the capture loop `repeats` times. Take MEDIAN across runs so
+    single-shot variance (PyQt timing jitter, GC pauses, transient DWM
+    work) doesn't sneak misleading numbers onto the chart. Returns the
+    median dict with `valid_runs` and `valid_min/max` annotations so we
+    can see if a cell is unstable."""
+    runs = []
+    for i in range(repeats):
+        runs.append(_single_run(capture_fn, duration_s, warmup_s if i == 0 else 0.2))
+    by_valid = sorted(runs, key=lambda r: r["valid_fps"])
+    med = by_valid[len(by_valid) // 2]
+    valids = [r["valid_fps"] for r in runs]
+    print(
+        f"  {name:<32} unique={med['unique_fps']:6.1f}  "
+        f"valid={med['valid_fps']:6.1f} (min {min(valids):.1f} max {max(valids):.1f})  "
+        f"calls={med['call_fps']:7.1f}  %ch={med['pct_changed']:4.0f}%"
+    )
+    out = dict(med)
+    out["name"] = name
+    out["valid_runs"] = valids
+    out["valid_min"] = min(valids)
+    out["valid_max"] = max(valids)
+    return out
 
 
 # -------- one wrapper per library --------
@@ -277,35 +311,83 @@ def bench_mss(label="mss"):
         sct.close()
 
 
-# -------- orchestration --------
+# -------- orchestration via subprocess-per-capturer --------
+
+def run_one_capturer(name):
+    """Spawn `_runner.py <name>` as a fresh Python process and parse
+    its JSON output. Returns the summary dict, or None on failure."""
+    runner = os.path.join(HERE, "_runner.py")
+    cmd = [
+        sys.executable, runner, name,
+        str(DURATION_S), str(WARMUP_S), str(REPEATS),
+    ]
+    summary = None
+    try:
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            bufsize=1, text=True,
+        )
+    except Exception as e:
+        print(f"  [{name} failed to spawn: {e}]")
+        return None
+
+    try:
+        while True:
+            line = proc.stdout.readline()
+            if not line:
+                break
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = __import__("json").loads(line)
+            except Exception:
+                continue
+            if "run" in obj:
+                r = obj["run"]
+                print(
+                    f"  [{name:<22} run {r['run_idx']}] "
+                    f"valid={r['valid_fps']:6.1f}  "
+                    f"unique={r['unique_fps']:6.1f}  "
+                    f"%ch={r['pct_changed']:5.1f}",
+                    flush=True,
+                )
+            elif "summary" in obj:
+                summary = obj["summary"]
+        proc.wait(timeout=10)
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+    err = proc.stderr.read() if proc.stderr else ""
+    if summary is None:
+        # Show the subprocess stderr so we can see what went wrong
+        if err.strip():
+            print(f"  [{name} no summary; stderr first 400 chars]: {err.strip()[:400]}")
+        else:
+            print(f"  [{name} no summary returned]")
+    return summary
+
 
 def run_round(label_prefix, stim_fn):
-    """Spin up the stimulus, run each capturer, tear down."""
     print(f"\n== {label_prefix} ==")
     stim = stim_fn()
     try:
         time.sleep(0.5)
         out = []
-        for fn in (
-            bench_rustcam_nocursor,
-            bench_rustcam_cursor,
-            bench_rustcam_bg,
-            bench_rustcam_gpu,
-            bench_bettercam_grab,
-            bench_bettercam_start,
-            bench_dxcam_grab,
-            bench_dxcam_start,
-            bench_mss,
-        ):
-            try:
-                out.append(fn())
-            except Exception as e:
-                print(f"  [{fn.__name__} failed: {e}]")
-            time.sleep(0.7)
+        for cap in CAPTURERS:
+            summary = run_one_capturer(cap)
+            if summary is not None:
+                print(
+                    f"  --> median valid={summary['valid_fps']:6.1f} "
+                    f"(min {summary['valid_min']:.1f} max {summary['valid_max']:.1f})"
+                )
+                out.append(summary)
         return out
     finally:
         kill_proc(stim)
-        time.sleep(0.4)
+        time.sleep(0.5)
 
 
 def main():
@@ -333,32 +415,54 @@ if __name__ == "__main__":
         b = by_name_m.get(n, {}).get("unique_fps", float("nan"))
         print(f"  {n:<28} {a:14.1f} {b:14.1f}")
 
+    # Persist raw data so we can sanity-check before publishing the chart
+    import json
+    raw_path = os.path.join(ROOT, "docs", "benchmark_raw.json")
+    os.makedirs(os.path.dirname(raw_path), exist_ok=True)
+    with open(raw_path, "w") as f:
+        json.dump({"flip_demo": flip, "mover_py": mover}, f, indent=2)
+    print(f"raw -> {raw_path}")
+
     # Chart
     try:
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
 
-        # valid_fps is the honest "frames-per-second-delivered" metric.
-        # unique_fps is biased by the hashing cost + content periodicity;
-        # %changed (annotated below each bar) is the freshness check.
         labels = [r["name"] for r in flip]
         flip_vals = [r["valid_fps"] for r in flip]
+        flip_min = [r.get("valid_min", r["valid_fps"]) for r in flip]
+        flip_max = [r.get("valid_max", r["valid_fps"]) for r in flip]
         mover_vals = []
+        mover_min = []
+        mover_max = []
         mover_changed = []
         for n in labels:
             r = next((r for r in mover if r["name"] == n), None)
             mover_vals.append(r["valid_fps"] if r else 0.0)
+            mover_min.append(r.get("valid_min", r["valid_fps"]) if r else 0.0)
+            mover_max.append(r.get("valid_max", r["valid_fps"]) if r else 0.0)
             mover_changed.append(r["pct_changed"] if r else 0.0)
 
         x = np.arange(len(labels))
         w = 0.38
         fig, ax = plt.subplots(figsize=(12, 6.5))
+        flip_err = [
+            [max(0, m - lo) for m, lo in zip(flip_vals, flip_min)],
+            [max(0, hi - m) for m, hi in zip(flip_vals, flip_max)],
+        ]
+        mover_err = [
+            [max(0, m - lo) for m, lo in zip(mover_vals, mover_min)],
+            [max(0, hi - m) for m, hi in zip(mover_vals, mover_max)],
+        ]
         bars1 = ax.bar(x - w / 2, flip_vals, w,
                        label="flip_demo (180 fps full-screen flip)",
-                       color="#4C9F38")
+                       color="#4C9F38", yerr=flip_err, capsize=3,
+                       error_kw={"ecolor": "#333", "lw": 0.7})
         bars2 = ax.bar(x + w / 2, mover_vals, w,
-                       label="mover.py (orbital window)", color="#1f77b4")
+                       label="mover.py (orbital window)", color="#1f77b4",
+                       yerr=mover_err, capsize=3,
+                       error_kw={"ecolor": "#333", "lw": 0.7})
         ax.axhline(180, color="grey", linestyle="--", linewidth=1.0,
                    alpha=0.7, label="180 Hz monitor refresh")
         ax.set_ylabel("frames-per-second delivered (valid grabs)")
