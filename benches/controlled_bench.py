@@ -378,8 +378,19 @@ def minimize_all_except(exclude_hwnds, exclude_titles=("rustcam benchmark",)):
 
 
 def restore_windows(hwnds):
+    """Restore in REVERSE Z-order so the originally-topmost window ends up
+    topmost again.
+
+    `EnumWindows` enumerates top-to-bottom. We minimized them in that order
+    (top first). When you `ShowWindow(SW_RESTORE)` a window, it comes back
+    on top of the stack. So if we restore in the same top-to-bottom order,
+    the originally-bottom window ends up on top of everything else.
+    Iterating in REVERSED order puts each restore on top of the previous
+    restore, recreating the original Z-order. The originally-topmost
+    window is restored last and lands on top.
+    """
     user32 = _ctypes.windll.user32
-    for h in hwnds:
+    for h in reversed(hwnds):
         try:
             user32.ShowWindow(h, _SW_RESTORE)
         except Exception:
