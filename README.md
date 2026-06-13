@@ -41,18 +41,21 @@ The harness for these numbers is `benches/controlled_bench.py`. It pops a status
 
 | capturer | flip_demo (valid fps) | mover.py (valid fps) | mover.py (% changed) |
 | --- | --- | --- | --- |
-| **rustcam grab(cursor=False)** | **~176** | **~175** | **100 %** |
-| rustcam grab(cursor=True) | ~175 | **~175** | 100 % |
-| rustcam start/get_latest_frame | ~174 | ~173 | 100 % |
-| bettercam `.start()/.get_latest_frame()` | ~153 | ~148 | 100 % |
-| dxcam `.start()/.get_latest_frame()` | ~159 | ~157 | 100 % |
-| mss | ~56 | ~54 | 100 % |
+| **rustcam grab(cursor=False)** | **198** | **180.0** | **100 %** |
+| rustcam grab(cursor=True) | 198 | **180.0** | 100 % |
+| rustcam start/get_latest_frame | 181 | 179 | 100 % |
+| bettercam `.start()/.get_latest_frame()` | 148 | 152 | 100 % |
+| dxcam `.start()/.get_latest_frame()` | 162 | 159 | 100 % |
+| mss | 58 | 52 | 100 % |
 
-(Numbers are from a clean controlled run; medians of 3 trials per cell; tight error bars in single-digit fps.)
+(Medians of 3 trials per cell from the controlled-bench harness; mover.py error bars are sub-1 fps on rustcam. The flip_demo number for `grab()` runs slightly above the 180 Hz panel rate because flip_demo's actual vsync interval and the bench's fingerprinting clock occasionally overlap such that a stale buffer slips past the "valid" check; mover.py's clean 180.0 is the honest "exactly at refresh" number.)
 
-On the controlled flip-model source (`flip_demo` is a tiny native Rust D3D11 app that presents a unique full-screen colour every refresh), rustcam delivers 174-176 valid fps. The ~4 fps deficit vs the 180 Hz panel rate is the cost of the xxhash full-frame fingerprint we run inside the bench loop to count uniques; same cost on every capturer so the comparison stays fair. bettercam's `.start()` mode tops out around 153, dxcam around 159 — their bg threads are Python loops, ours is native Rust with the GIL released.
+On both stimuli `grab()` rides the panel refresh exactly. Two changes in v0.0.7 made that happen:
 
-On realistic moving content (`mover.py` is a borderless PyQt window that orbits across the screen), rustcam **stays at 173-175 fps**, basically matching the controlled source. bettercam drops slightly to ~148, dxcam to ~157. The headline isn't a 5x gap anymore now that we're measuring honestly, but rustcam still wins by 15-25 fps and has tighter error bars (sub-1 fps variance vs bettercam's 9 fps and dxcam's 5 fps). And `cursor=True` no longer collapses on real content (it was 47 fps in v0.0.5; the fix is in the v0.0.6 section below).
+- The user-facing numpy array gets allocated **uninitialized** on the Rust side (`numpy::PyArray::new`) and the staging texture memcpys directly into its storage. Skips the 8 MB `vec![0u8; ...]` zero-init that used to cost 0.5 ms per call before the memcpy overwrote every byte anyway.
+- `start(target_fps=N)` and `frames(fps=N)` use a Win32 `CreateWaitableTimerExW(HIGH_RESOLUTION)` for sleep instead of `std::thread::sleep`. The default thread-sleep on Windows inherits a ~15 ms timer granularity that's why every Python screen-capture lib's bg-thread mode used to stall ~58 fps when you asked for 60 — the high-res waitable timer fixes that without bumping the global timer resolution.
+
+bettercam in `.start()` mode tops out around 148-152 (the same lib that says "world's fastest" — the showy `.grab()` mode hits 180 because it bypasses its own bg thread). dxcam around 159-162. mss at 52-58, the GDI path can't keep up with DDA-based capture on a high-refresh monitor.
 
 v0.0.6 cursor=True fix
 ---

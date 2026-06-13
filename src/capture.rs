@@ -349,6 +349,19 @@ impl Capturer {
         self.bg.is_some() || self.busy.load(Ordering::Acquire)
     }
 
+    /// DEBUG: read the capture thread's current published seq counter.
+    /// Used to differentiate "capture thread is at rate X" vs "consumer is
+    /// the bottleneck at rate Y" when diagnosing pacing issues. Only
+    /// meaningful while a background capture (`start()` or `frames()`) is
+    /// running; returns 0 otherwise.
+    fn _debug_publish_seq(&self) -> u64 {
+        if let Some(bg) = self.bg.as_ref() {
+            let slot = bg.mailbox.buf.lock();
+            return slot.as_ref().map(|(f, _)| f.seq).unwrap_or(0);
+        }
+        0
+    }
+
     /// DEBUG: read the current cursor state (visibility, position, shape kind).
     /// Returns a dict so we can inspect what DDA has told us so far.
     fn _debug_cursor<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {

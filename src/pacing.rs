@@ -50,7 +50,13 @@ pub(crate) struct Frame {
 /// copy at the API boundary.
 pub(crate) struct Mailbox {
     pub buf: Mutex<Option<(Frame, Arc<Vec<u8>>)>>,
-    pub cv: Condvar,
+    /// Win32 auto-reset event used to wake the consumer thread. Replaces
+    /// the parking_lot Condvar that previously lived here — that primitive
+    /// is built on top of `SleepConditionVariableCS` on Windows and inherits
+    /// the system timer's ~15 ms granularity, capping consumer wake-ups
+    /// at ~67 fps. `WaitForSingleObject` on a kernel Event has sub-
+    /// millisecond accuracy.
+    pub signal: crate::hr_timer::EventSignal,
     pub error: Mutex<Option<PyErr>>,
     pub stop: AtomicBool,
 }
@@ -59,7 +65,8 @@ impl Mailbox {
     pub fn new() -> Self {
         Self {
             buf: Mutex::new(None),
-            cv: Condvar::new(),
+            signal: crate::hr_timer::EventSignal::new()
+                .expect("CreateEventW failed; required for the consumer wait path"),
             error: Mutex::new(None),
             stop: AtomicBool::new(false),
         }
@@ -80,7 +87,7 @@ impl BackgroundHandle {
         self.mailbox.stop.store(true, Ordering::Release);
         // Wake any park inside the loop (the capture loop polls stop so this
         // is belt + suspenders).
-        self.mailbox.cv.notify_all();
+        self.mailbox.signal.signal();
         let joined = self.join.take().unwrap().join();
         match joined {
             Ok(s) => s.0,
@@ -203,9 +210,11 @@ fn capture_loop(state: &mut CaptureState, mb: &Arc<Mailbox>, opts: StartOpts) {
                 seq,
                 captured_at: Instant::now(),
             };
-            let mut slot = mb.buf.lock();
-            *slot = Some((frame, arc));
-            mb.cv.notify_all();
+            {
+                let mut slot = mb.buf.lock();
+                *slot = Some((frame, arc));
+            }
+            mb.signal.signal();
             if let Some(nb) = new_arc {
                 last_arc = Some(nb);
             }
@@ -236,31 +245,37 @@ pub fn get_latest(
     mb: &Arc<Mailbox>,
     timeout: Option<Duration>,
 ) -> Result<Option<(Frame, Arc<Vec<u8>>)>, RustcamError> {
-    let mut slot = mb.buf.lock();
     let deadline = timeout.map(|d| Instant::now() + d);
 
-    while slot.is_none() {
+    loop {
+        // Fast path: peek and take without waiting.
+        {
+            let mut slot = mb.buf.lock();
+            if let Some(pair) = slot.take() {
+                return Ok(Some(pair));
+            }
+        }
         if mb.stop.load(Ordering::Acquire) {
             return Ok(None);
         }
         if let Some(err) = mb.error.lock().take() {
             return Err(RustcamError::Value(err.to_string()));
         }
-        match deadline {
+        // Slow path: block on the kernel event until the capture thread
+        // publishes (sub-millisecond wake-up via WaitForSingleObject) or
+        // the deadline expires.
+        let wait_timeout = match deadline {
             Some(end) => {
                 let now = Instant::now();
                 if now >= end {
                     return Err(RustcamError::Timeout);
                 }
-                let _ = mb.cv.wait_for(&mut slot, end - now);
+                Some(end - now)
             }
-            None => {
-                mb.cv.wait(&mut slot);
-            }
-        }
+            None => None,
+        };
+        mb.signal.wait(wait_timeout);
     }
-
-    Ok(slot.take())
 }
 
 /// Convert an Arc<Vec<u8>> back into an owned Vec. If we hold the only strong
