@@ -34,6 +34,33 @@ impl From<windows::core::Error> for RustcamError {
     }
 }
 
+/// Bridge from the shared `dda_capture` error type into ours, so any module
+/// using `dda_capture::Result<_>` can `?` into a `RustcamError` context.
+impl From<dda_capture::errors::DdaError> for RustcamError {
+    fn from(e: dda_capture::errors::DdaError) -> Self {
+        match e {
+            dda_capture::errors::DdaError::Dxgi(err) => RustcamError::Dxgi(err),
+            dda_capture::errors::DdaError::Value(s) => RustcamError::Value(s),
+        }
+    }
+}
+
+/// Helper for sites that have a `Result<_, dda_capture::DdaError>` and want
+/// to `?` straight into `PyResult<_>`. The orphan rule prevents a direct
+/// `impl From<DdaError> for PyErr` (neither type is local), so callers use:
+///   `dda_result.map_err(RustcamError::from)?`
+/// or this trait:
+///   `dda_result.into_py()?`
+pub trait DdaResultExt<T> {
+    fn into_py(self) -> Result<T, PyErr>;
+}
+
+impl<T> DdaResultExt<T> for Result<T, dda_capture::errors::DdaError> {
+    fn into_py(self) -> Result<T, PyErr> {
+        self.map_err(|e| RustcamError::from(e).into())
+    }
+}
+
 #[allow(dead_code)]
 pub enum RustcamError {
     Dxgi(windows::core::Error),

@@ -34,15 +34,20 @@ DURATION_S = 3.0
 WARMUP_S = 0.5
 REPEATS = 3  # number of timed runs per capturer; we take the median
 
-# Capturers and the keys understood by _runner.py
+# Capturers and the keys understood by _runner.py.
+#
+# Note on bettercam/dxcam: only `.start()` mode is included. The previous
+# bench compared `.grab()` (one-shot, tight loop, ~180 fps on a controlled
+# flip source) against rustcam's normal API. That comparison was apples to
+# oranges: no production code uses .grab() in a tight while-True loop —
+# .start() + .get_latest_frame() is the universal pattern. .grab() lights
+# up benchmarks but is not how either library is actually used.
 CAPTURERS = [
     "rustcam_nocursor",
     "rustcam_cursor",
     "rustcam_bg",
     "rustcam_gpu",
-    "bettercam_grab",
     "bettercam_start",
-    "dxcam_grab",
     "dxcam_start",
     "mss",
 ]
@@ -246,19 +251,6 @@ def bench_rustcam_gpu(label="rustcam grab_gpu (no readback)"):
         cap.close()
 
 
-def bench_bettercam_grab(label="bettercam .grab()"):
-    """bettercam.grab() one-shot mode. Each call hits AcquireNextFrame
-    directly. This is the SHOWY mode — fast, but not how typical users
-    invoke bettercam in real code."""
-    import bettercam
-    cam = bettercam.create(output_idx=0)
-    try:
-        return bench(label, lambda: cam.grab())
-    finally:
-        cam.release()
-        import time; time.sleep(0.5)
-
-
 def bench_bettercam_start(label="bettercam .start/.get_latest_frame"):
     """The TYPICAL bettercam usage pattern — `.start()` spawns its bg
     capture thread and `.get_latest_frame()` blocks until a fresh
@@ -274,16 +266,6 @@ def bench_bettercam_start(label="bettercam .start/.get_latest_frame"):
         cam.stop()
         cam.release()
         time.sleep(0.5)
-
-
-def bench_dxcam_grab(label="dxcam .grab()"):
-    import dxcam
-    cam = dxcam.create(output_idx=0)
-    try:
-        return bench(label, lambda: cam.grab())
-    finally:
-        cam.release()
-        import time; time.sleep(0.5)
 
 
 def bench_dxcam_start(label="dxcam .start/.get_latest_frame"):

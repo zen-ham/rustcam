@@ -46,6 +46,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d0a5c400df2834b80a4c3327b3aad3a4c4cd4de0629063962b03235697506a28"
 
 [[package]]
+name = "dda_capture"
+version = "0.1.0"
+source = "git+https://github.com/zen-ham/dda_capture?branch=master#8ecaeaf2c81b89ae137342b5eedcd132f1f723fb"
+dependencies = [
+ "windows",
+]
+
+[[package]]
 name = "find-msvc-tools"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -296,6 +304,7 @@ name = "rustcam"
 version = "0.0.5"
 dependencies = [
  "crossbeam-channel",
+ "dda_capture",
  "numpy",
  "once_cell",
  "parking_lot",

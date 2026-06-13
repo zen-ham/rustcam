@@ -278,7 +278,8 @@ impl Capturer {
         let state = CaptureState::new(device, output, cursor)?;
         let full = Region::full(state.width, state.height);
         let region = match region {
-            Some(t) => Region::from_tuple(t, state.width, state.height)?,
+            Some(t) => Region::from_tuple(t, state.width, state.height)
+                .map_err(crate::errors::RustcamError::from)?,
             None => full,
         };
         let cached_width = state.width;
@@ -387,7 +388,8 @@ impl Capturer {
         })?;
         let state = self.state_mut()?;
         let region = match region {
-            Some(t) => Region::from_tuple(t, state.width, state.height)?,
+            Some(t) => Region::from_tuple(t, state.width, state.height)
+                .map_err(crate::errors::RustcamError::from)?,
             None => self.region,
         };
 
@@ -475,7 +477,7 @@ impl Capturer {
                 Err(e) => {
                     // restore state on validation failure
                     self.state = Some(state);
-                    return Err(e.into());
+                    return Err(crate::errors::RustcamError::from(e).into());
                 }
             },
             None => self.region,
@@ -556,7 +558,7 @@ impl Capturer {
                 Ok(r) => r,
                 Err(e) => {
                     self.state = Some(state);
-                    return Err(e.into());
+                    return Err(crate::errors::RustcamError::from(e).into());
                 }
             },
             None => self.region,

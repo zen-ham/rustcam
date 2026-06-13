@@ -107,10 +107,6 @@ def open_capturer(name):
             seq[0] += 1
             return np.full((256, 1, 3), seq[0] & 0xFF, dtype=np.uint8)
         return ("rustcam grab_gpu (no readback)", _g, cap.close)
-    if name == "bettercam_grab":
-        import bettercam
-        cam = bettercam.create(output_idx=0)
-        return ("bettercam .grab()", cam.grab, cam.release)
     if name == "bettercam_start":
         import bettercam
         cam = bettercam.create(output_idx=0)
@@ -122,10 +118,6 @@ def open_capturer(name):
             finally:
                 cam.release()
         return ("bettercam .start/.get_latest_frame", cam.get_latest_frame, teardown)
-    if name == "dxcam_grab":
-        import dxcam
-        cam = dxcam.create(output_idx=0)
-        return ("dxcam .grab()", cam.grab, cam.release)
     if name == "dxcam_start":
         import dxcam
         cam = dxcam.create(output_idx=0)
