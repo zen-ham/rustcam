@@ -353,7 +353,7 @@ if __name__ == "__main__":
 
         x = np.arange(len(labels))
         w = 0.38
-        fig, ax = plt.subplots(figsize=(11, 5.2))
+        fig, ax = plt.subplots(figsize=(12, 6.5))
         bars1 = ax.bar(x - w / 2, flip_vals, w,
                        label="flip_demo (180 fps full-screen flip)",
                        color="#4C9F38")
@@ -365,7 +365,8 @@ if __name__ == "__main__":
         ax.set_title("rustcam vs bettercam vs dxcam vs mss   (1080p, 4 s capture)\n"
                      "valid fps = non-None returns per second; ride the 180 Hz line = the lib is keeping up")
         ax.set_xticks(x)
-        ax.set_xticklabels([s.replace(" ", "\n", 1) for s in labels], fontsize=9)
+        ax.set_xticklabels(labels, fontsize=9, rotation=45, ha="right",
+                           rotation_mode="anchor")
         ax.grid(axis="y", linestyle="--", alpha=0.4)
         for bars, vals in ((bars1, flip_vals), (bars2, mover_vals)):
             for bar, v in zip(bars, vals):
