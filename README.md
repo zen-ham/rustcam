@@ -41,14 +41,14 @@ The harness for these numbers is `benches/controlled_bench.py`. It pops a status
 
 | capturer | flip_demo (valid fps) | mover.py (valid fps) | mover.py (% changed) |
 | --- | --- | --- | --- |
-| **rustcam grab(cursor=False)** | **177** | **179** | **100 %** |
-| rustcam grab(cursor=True) | 178 | **180+** | 100 % |
-| rustcam start/get_latest_frame | 178 | 173 | 96 % |
-| bettercam `.start()/.get_latest_frame()` | 156 | 149 | 98 % |
-| dxcam `.start()/.get_latest_frame()` | 129 | 128 | 100 % |
-| mss | 44 | 44 | 100 % |
+| **rustcam grab(cursor=False)** | **180.0** | **180.0** | **100 %** |
+| rustcam grab(cursor=True) | **180.0** | **180.0** | 100 % |
+| rustcam start/get_latest_frame | 180.0 | 178 | 100 % |
+| bettercam `.start()/.get_latest_frame()` | 159 | 149 | 100 % |
+| dxcam `.start()/.get_latest_frame()` | 130 | 127 | 100 % |
+| mss | 45 | 44 | 100 % |
 
-Medians of 3 trials per cell from the controlled-bench harness; error bars are sub-1 fps on rustcam. The `180+` on `rustcam grab(cursor=True)` / mover.py means the bar visually clips at the 180 Hz panel refresh in the chart, but DDA delivered measurably more than 180 frames in that second. That's not a software ceiling, it's the panel ceiling that the chart is honoring so you can see at a glance "rustcam hit refresh and ran out of room to go faster". mover.py presents above refresh during its orbital loop and DWM composites those, so DDA reports them; everything still bounded by what the panel can actually show, so the cap on the y-axis is the honest number to compare against the other capturers.
+Medians of 3 trials per cell from the controlled-bench harness; error bars are sub-1 fps on rustcam. The chart's y-axis is capped at the 180 Hz monitor refresh and annotates a `+` suffix on any bar where DDA delivered measurably more than that — that's the panel ceiling honored visually, not a software limit (apps that present at no-sync intervals can briefly push DDA above refresh, but the panel can never show more than 180 frames/sec so the comparison only makes sense capped). When `+` doesn't appear, the capturer settled exactly at refresh.
 
 On both stimuli `grab()` saturates the panel refresh. Three changes across v0.0.7-v0.0.8 made that happen:
 
