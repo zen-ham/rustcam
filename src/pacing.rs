@@ -127,6 +127,12 @@ fn capture_loop(state: &mut CaptureState, mb: &Arc<Mailbox>, opts: StartOpts) {
     };
     let mut next_deadline = Instant::now();
     let region = opts.region;
+    // High-res waitable timer for paced sleeps. std::thread::sleep on
+    // Windows has ~15ms granularity which caps `target_fps=60` at ~58 fps
+    // in practice. CreateWaitableTimerExW(HIGH_RESOLUTION) gets us
+    // sub-millisecond accuracy without touching the global timer res.
+    // Falls back to std::thread::sleep if the OS doesn't support it.
+    let hr = crate::hr_timer::HrTimer::new().ok();
 
     loop {
         if mb.stop.load(Ordering::Acquire) {
@@ -209,7 +215,12 @@ fn capture_loop(state: &mut CaptureState, mb: &Arc<Mailbox>, opts: StartOpts) {
             next_deadline += period;
             let now = Instant::now();
             if next_deadline > now {
-                std::thread::sleep(next_deadline - now);
+                let delta = next_deadline - now;
+                if let Some(t) = hr.as_ref() {
+                    t.sleep(delta);
+                } else {
+                    std::thread::sleep(delta);
+                }
             } else {
                 // We're behind schedule — reset to now so we don't burn a
                 // backlog of zero-duration sleeps.
@@ -301,6 +312,8 @@ pub struct FramesIter {
     last_buf: Option<Arc<Vec<u8>>>,
     /// Per-slot wait deadline (timeout_ms in the public API)
     slot_timeout: Duration,
+    /// High-res timer for sub-ms slot pacing.
+    hr_timer: Option<crate::hr_timer::HrTimer>,
     /// Whether we've handed back the parent's CaptureState yet.
     closed: bool,
 }
@@ -329,6 +342,7 @@ impl FramesIter {
             last_seq: 0,
             last_buf: None,
             slot_timeout: timeout,
+            hr_timer: crate::hr_timer::HrTimer::new().ok(),
             closed: false,
         }
     }
@@ -373,7 +387,11 @@ impl FramesIter {
         let now = Instant::now();
         if slot_wall > now {
             let to_sleep = slot_wall - now;
-            py.detach(|| std::thread::sleep(to_sleep));
+            if let Some(t) = self.hr_timer.as_ref() {
+                py.detach(|| t.sleep(to_sleep));
+            } else {
+                py.detach(|| std::thread::sleep(to_sleep));
+            }
         }
 
         // Drain mailbox: prefer a fresh frame, else dup the last we emitted.

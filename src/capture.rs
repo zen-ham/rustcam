@@ -68,6 +68,11 @@ pub struct CaptureState {
     pub adapter_luid: (u32, i32),
     /// Lazy GPU-shared producer state for `grab_gpu()`.
     pub gpu: Option<GpuProducerState>,
+    /// Reusable BGRA scratch buffer for non-BGRA grab paths (format
+    /// conversion / cursor composite work in this buffer before the final
+    /// convert step writes into the user-facing numpy array). Sized to
+    /// the full output at construction; not reallocated per call.
+    pub scratch_bgra: Vec<u8>,
 }
 
 impl CaptureState {
@@ -173,6 +178,7 @@ impl CaptureState {
                 cursor_state: CursorState::default(),
                 adapter_luid,
                 gpu: None,
+                scratch_bgra: vec![0u8; (width as usize) * (height as usize) * 4],
             };
 
             // Discard the first DDA frame (often black on warm-up).
@@ -393,59 +399,93 @@ impl Capturer {
             None => self.region,
         };
 
-        // Acquire + map without holding the GIL. Build the dst Vec<u8> in BGRA, then
-        // (still without the GIL) format-convert if needed.
-        let bgra: Option<Vec<u8>> = py.detach(|| -> CapResult<Option<Vec<u8>>> {
+        // Create the user-facing numpy array as UNINITIALIZED on the GIL
+        // side. We'll memcpy from the staging texture directly into its
+        // storage during the GIL-released window. Avoids the 8 MB zero-
+        // init that `vec![0u8; ...]` did per call (~0.5 ms wasted at
+        // 1080p) before the memcpy overwrote every byte anyway.
+        let w = region.width() as usize;
+        let h = region.height() as usize;
+        let channels = fmt.channels();
+        let arr: Bound<'py, PyArray3<u8>> =
+            unsafe { numpy::PyArray::<u8, _>::new(py, [h, w, channels], false) };
+
+        // Raw pointer into numpy's storage. The pointer is valid for the
+        // lifetime of `arr`, which extends past the py.detach window.
+        // pyo3's Ungil bound rejects closures that capture `*mut T` even
+        // when wrapped in a Send-marked type, so we pass the address as
+        // `usize` and cast back inside the closure body.
+        let dst_ptr_addr = unsafe { arr.data() } as usize;
+        let dst_len = h * w * channels;
+
+        let got = py.detach(move || -> CapResult<bool> {
+            let dst_ptr = dst_ptr_addr as *mut u8;
             unsafe {
-                let got = self.state_unchecked_mut().try_acquire_into_capture(timeout_ms)?;
-                if !got {
-                    return Ok(None);
-                }
-                let m = self.state_unchecked_mut().map_staging()?;
-                let w = region.width() as usize;
-                let h = region.height() as usize;
-                let mut buf = vec![0u8; w * h * 4];
-                crop_copy_bgra(&mut buf, m.pData as *const u8, m.RowPitch as usize, region);
-                self.state_unchecked_mut().unmap_staging();
-                // Software cursor composite into the BGRA buffer. No GDI,
-                // no GPU sync barrier. Cursor position + shape were updated
-                // from DDA's frame info inside try_acquire_into_capture.
                 let s = self.state_unchecked_mut();
-                if s.cursor {
-                    composite_cursor_into_bgra(
-                        &mut buf,
-                        region.width(),
-                        region.height(),
-                        region.left as i32,
-                        region.top as i32,
-                        &s.cursor_state,
-                    );
+                let got = s.try_acquire_into_capture(timeout_ms)?;
+                if !got {
+                    return Ok(false);
                 }
-                Ok(Some(buf))
+                let m = s.map_staging()?;
+                let dst_slice = std::slice::from_raw_parts_mut(dst_ptr, dst_len);
+
+                match fmt {
+                    Fmt::Bgra => {
+                        // Direct staging -> numpy memcpy.
+                        crop_copy_bgra(
+                            dst_slice,
+                            m.pData as *const u8,
+                            m.RowPitch as usize,
+                            region,
+                        );
+                        s.unmap_staging();
+                        if s.cursor {
+                            composite_cursor_into_bgra(
+                                dst_slice,
+                                region.width(),
+                                region.height(),
+                                region.left as i32,
+                                region.top as i32,
+                                &s.cursor_state,
+                            );
+                        }
+                    }
+                    _ => {
+                        // Crop staging into the reusable scratch BGRA buffer,
+                        // composite the cursor into it, then format-convert
+                        // into the user-facing numpy array.
+                        let needed = w * h * 4;
+                        if s.scratch_bgra.len() < needed {
+                            s.scratch_bgra.resize(needed, 0);
+                        }
+                        crop_copy_bgra(
+                            &mut s.scratch_bgra[..needed],
+                            m.pData as *const u8,
+                            m.RowPitch as usize,
+                            region,
+                        );
+                        s.unmap_staging();
+                        if s.cursor {
+                            composite_cursor_into_bgra(
+                                &mut s.scratch_bgra[..needed],
+                                region.width(),
+                                region.height(),
+                                region.left as i32,
+                                region.top as i32,
+                                &s.cursor_state,
+                            );
+                        }
+                        bgra_to(fmt, &s.scratch_bgra[..needed], dst_slice, w, h);
+                    }
+                }
+                Ok(true)
             }
         })?;
 
-        let bgra = match bgra {
-            Some(v) => v,
-            None => return Ok(None),
-        };
-
-        let w = region.width() as usize;
-        let h = region.height() as usize;
-
-        let array = match fmt {
-            Fmt::Bgra => {
-                let arr = bgra.into_pyarray(py);
-                arr.reshape([h, w, 4])?
-            }
-            _ => {
-                let mut out = vec![0u8; w * h * fmt.channels()];
-                py.detach(|| bgra_to(fmt, &bgra, &mut out, w, h));
-                let arr = out.into_pyarray(py);
-                arr.reshape([h, w, fmt.channels()])?
-            }
-        };
-        Ok(Some(array))
+        if !got {
+            return Ok(None);
+        }
+        Ok(Some(arr))
     }
 
     /// Spawn a background capture thread fed by AcquireNextFrame.

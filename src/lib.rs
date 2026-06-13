@@ -7,6 +7,7 @@ mod convert;
 mod cursor;
 mod errors;
 mod gpu;
+mod hr_timer;
 mod pacing;
 mod region;
 
