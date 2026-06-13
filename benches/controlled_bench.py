@@ -42,6 +42,22 @@ DURATION_S = 4.0
 WARMUP_S = 0.5
 REPEATS = 3
 
+# Per-round warmup pass: before any timed measurement starts in a given
+# stimulus round, open + briefly run + close EVERY capturer once. Purposes:
+#   1. Page in the rustcam .pyd / cargo native deps / DXGI runtime that
+#      otherwise only get loaded the first time the capturer is opened.
+#   2. Let Windows Defender's real-time-protection scan freshly-built
+#      binaries (often the dominant source of the "first run after maturin
+#      compile" perf drop).
+#   3. Bring up bg-thread internal state for bettercam / dxcam / rustcam_bg
+#      so their first measurement trial isn't competing with thread startup.
+#   4. Stabilize the stimulus subprocess's swap-chain / DWM composition
+#      mode after its initial 1.5s post-launch grace period.
+# Results from this pass are discarded; only the interleaved measurement
+# trials after it count toward the chart.
+WARMUP_PASS_DURATION_S = 1.5
+WARMUP_PASS_WARMUP_S = 0.3
+
 
 # ----- monitor enumeration (find the top monitor) ------------------------
 
@@ -252,30 +268,105 @@ CAPTURERS = [
 ]
 
 
-def bench_one(name, q_status, idx, total_caps, stim_label):
-    """Run REPEATS isolated trials of `name`. Updates UI via `q_status`."""
+def _open_or_skip(name):
+    """Try to open `name`; return (label, fn, teardown) or None on failure."""
     try:
-        label, fn, teardown = open_capturer(name)
-    except Exception as e:
-        return dict(name=name, error=str(e))
-    runs = []
-    try:
-        for r in range(REPEATS):
-            q_status.put(("step", f"{stim_label}: {label}",
-                          f"run {r+1}/{REPEATS}",
-                          ((idx + (r+0.0)/REPEATS) / total_caps) * 100))
-            res = _single_run(fn, DURATION_S, WARMUP_S if r == 0 else 0.2)
-            runs.append(res)
-    finally:
-        try: teardown()
-        except Exception: pass
-    by_v = sorted(runs, key=lambda r: r["valid_fps"])
-    med = by_v[len(by_v) // 2]
-    valids = [r["valid_fps"] for r in runs]
-    return dict(name=label, key=name,
-                unique_fps=med["unique_fps"], valid_fps=med["valid_fps"],
-                pct_changed=med["pct_changed"],
-                valid_runs=valids, valid_min=min(valids), valid_max=max(valids))
+        return open_capturer(name)
+    except Exception:
+        return None
+
+
+def _round_warmup(stim_label, q_status, round_idx, total_rounds):
+    """Single warmup pass: open + briefly run + close each capturer once.
+
+    Discards results. Purpose is to flush per-capturer one-time costs (binary
+    paging, Defender scan, DDA stream init, bg-thread startup) BEFORE the
+    measurement trials begin, so the first measured trial isn't the one
+    paying that cost.
+    """
+    # Warmup occupies roughly the first 15% of the round's progress bar.
+    round_base = round_idx / total_rounds * 100.0
+    round_span = 100.0 / total_rounds
+    warmup_span = round_span * 0.15
+    for i, name in enumerate(CAPTURERS):
+        pct = round_base + warmup_span * ((i + 0.5) / len(CAPTURERS))
+        q_status.put(("step", f"{stim_label}: warming up {name}",
+                      f"warmup pass {i+1}/{len(CAPTURERS)} (results discarded)",
+                      pct))
+        opened = _open_or_skip(name)
+        if opened is None:
+            continue
+        _, fn, teardown = opened
+        try:
+            _single_run(fn, WARMUP_PASS_DURATION_S, WARMUP_PASS_WARMUP_S)
+        finally:
+            try: teardown()
+            except Exception: pass
+
+
+def _round_measure_interleaved(stim_label, q_status, round_idx, total_rounds):
+    """Run REPEATS x len(CAPTURERS) trials interleaved across capturers.
+
+    Outer loop = trial index (1..REPEATS); inner loop = capturer. So each
+    capturer's REPEATS trials are spread evenly across the round's wall-
+    clock. Any environmental fluctuation that happens during a localized
+    time window of the round hits every capturer proportionally instead of
+    landing all of one capturer's trials on top of it.
+
+    Returns a list of per-capturer summary dicts (same shape the prior
+    sequential bench_one used to return), preserving CAPTURERS order.
+    """
+    runs_by_cap = {name: [] for name in CAPTURERS}
+    labels_by_cap = {}
+    errors_by_cap = {}
+    total_trials = REPEATS * len(CAPTURERS)
+    round_base = round_idx / total_rounds * 100.0
+    round_span = 100.0 / total_rounds
+    # Measurement occupies the last 85% of the round's progress bar.
+    measure_start = round_base + round_span * 0.15
+    measure_span = round_span * 0.85
+    cur = 0
+    for trial_idx in range(REPEATS):
+        for name in CAPTURERS:
+            cur += 1
+            pct = measure_start + measure_span * (cur / total_trials)
+            q_status.put((
+                "step",
+                f"{stim_label}: {name} trial {trial_idx+1}/{REPEATS}",
+                f"interleaved measurement {cur}/{total_trials}",
+                pct,
+            ))
+            opened = _open_or_skip(name)
+            if opened is None:
+                errors_by_cap[name] = "open_capturer failed"
+                continue
+            label, fn, teardown = opened
+            labels_by_cap[name] = label
+            try:
+                # Short per-trial warmup is still useful (settle DDA after
+                # construction); the heavy paging is already done by the
+                # round-level warmup pass above.
+                res = _single_run(fn, DURATION_S, 0.2)
+                runs_by_cap[name].append(res)
+            finally:
+                try: teardown()
+                except Exception: pass
+
+    out = []
+    for name in CAPTURERS:
+        runs = runs_by_cap[name]
+        if not runs:
+            out.append(dict(name=labels_by_cap.get(name, name), key=name,
+                            error=errors_by_cap.get(name, "no successful trials")))
+            continue
+        by_v = sorted(runs, key=lambda r: r["valid_fps"])
+        med = by_v[len(by_v) // 2]
+        valids = [r["valid_fps"] for r in runs]
+        out.append(dict(name=labels_by_cap[name], key=name,
+                        unique_fps=med["unique_fps"], valid_fps=med["valid_fps"],
+                        pct_changed=med["pct_changed"],
+                        valid_runs=valids, valid_min=min(valids), valid_max=max(valids)))
+    return out
 
 
 # ----- stimulus subprocess helpers ---------------------------------------
@@ -424,10 +515,9 @@ def bench_worker(q_status, out_results, status_hwnd):
         flip = start_flip_demo()
         time.sleep(1.5)
         try:
-            for i, name in enumerate(CAPTURERS):
-                r = bench_one(name, q_status, i, len(CAPTURERS) * 2,
-                              "flip_demo")
-                results["flip_demo"].append(r)
+            _round_warmup("flip_demo", q_status, round_idx=0, total_rounds=2)
+            results["flip_demo"] = _round_measure_interleaved(
+                "flip_demo", q_status, round_idx=0, total_rounds=2)
         finally:
             kill_proc(flip)
             time.sleep(0.5)
@@ -435,16 +525,23 @@ def bench_worker(q_status, out_results, status_hwnd):
         # ---- mover.py round ----
         q_status.put(("step", "starting mover.py (orbital window)...",
                       "this is the realistic-content test", 50.0))
-        # generous budget so it stays alive through all measurements
-        per_cap = REPEATS * DURATION_S + WARMUP_S + 4.0
-        mover_budget = per_cap * len(CAPTURERS) + 8.0
+        # Budget for mover.py covers: warmup pass (open + 1.5s + close per
+        # capturer) + interleaved measurement pass (open + 4s + close per
+        # trial, REPEATS x len(CAPTURERS) trials) + slack for stim startup
+        # and bg-thread sleeps inside open_capturer. Generous on purpose -
+        # mover.py just dies when its budget elapses, so over-budgeting is
+        # cheap insurance against the bench running long.
+        per_warm = WARMUP_PASS_DURATION_S + WARMUP_PASS_WARMUP_S + 1.5
+        per_meas = DURATION_S + 0.2 + 1.5  # trial + per-trial warmup + open/teardown
+        mover_budget = (per_warm * len(CAPTURERS)
+                        + per_meas * REPEATS * len(CAPTURERS)
+                        + 12.0)
         mover = start_mover(mover_budget)
         time.sleep(1.5)
         try:
-            for i, name in enumerate(CAPTURERS):
-                r = bench_one(name, q_status, len(CAPTURERS) + i,
-                              len(CAPTURERS) * 2, "mover.py")
-                results["mover_py"].append(r)
+            _round_warmup("mover.py", q_status, round_idx=1, total_rounds=2)
+            results["mover_py"] = _round_measure_interleaved(
+                "mover.py", q_status, round_idx=1, total_rounds=2)
         finally:
             kill_proc(mover)
             time.sleep(0.5)

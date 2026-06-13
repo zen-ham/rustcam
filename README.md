@@ -41,14 +41,14 @@ The harness for these numbers is `benches/controlled_bench.py`. It pops a status
 
 | capturer | flip_demo (valid fps) | mover.py (valid fps) | mover.py (% changed) |
 | --- | --- | --- | --- |
-| **rustcam grab(cursor=False)** | **180.0** | **180.0** | **100 %** |
-| rustcam grab(cursor=True) | **180.0** | **180.0** | 100 % |
-| rustcam start/get_latest_frame | 180.0 | 178 | 100 % |
-| bettercam `.start()/.get_latest_frame()` | 159 | 149 | 100 % |
-| dxcam `.start()/.get_latest_frame()` | 130 | 127 | 100 % |
-| mss | 45 | 44 | 100 % |
+| **rustcam grab(cursor=False)** | **180+** | **179** | **100 %** |
+| rustcam grab(cursor=True) | **180+** | **179** | 100 % |
+| rustcam start/get_latest_frame | 180+ | 179 | 100 % |
+| bettercam `.start()/.get_latest_frame()` | 157 | 146 | 100 % |
+| dxcam `.start()/.get_latest_frame()` | 129 | 125 | 100 % |
+| mss | 44 | 44 | 100 % |
 
-Medians of 3 trials per cell from the controlled-bench harness; error bars are sub-1 fps on rustcam. The chart's y-axis is capped at the 180 Hz monitor refresh and annotates a `+` suffix on any bar where DDA delivered measurably more than that — that's the panel ceiling honored visually, not a software limit (apps that present at no-sync intervals can briefly push DDA above refresh, but the panel can never show more than 180 frames/sec so the comparison only makes sense capped). When `+` doesn't appear, the capturer settled exactly at refresh.
+Medians of 3 trials per cell from the controlled-bench harness; error bars on rustcam are well under 1 fps in every cell, often under 0.1 fps. The chart's y-axis is capped at the 180 Hz monitor refresh and annotates a `+` suffix on any bar where DDA delivered measurably more than that. That's the panel ceiling honored visually, not a software limit. flip_demo presents without strict vsync, so DXGI Desktop Duplication can hand us frames slightly faster than the panel can display them; the panel still only shows 180 frames/sec, but rustcam pulls every one DDA hands over (currently ~196 fps on flip_demo) so the comparison against the other capturers only makes sense capped to refresh rate. When `+` doesn't appear, the capturer settled exactly at the panel ceiling.
 
 On both stimuli `grab()` saturates the panel refresh. Three changes across v0.0.7-v0.0.8 made that happen:
 
