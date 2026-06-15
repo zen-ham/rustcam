@@ -58,19 +58,6 @@ On both stimuli `grab()` saturates the panel refresh. Three changes across v0.0.
 
 bettercam in `.start()` mode tops out around 149-156 (the same lib that says "world's fastest", the showy `.grab()` mode hits 180 because it bypasses its own bg thread). dxcam around 128-129. mss at 44, the GDI path can't keep up with DDA-based capture on a high-refresh monitor.
 
-v0.0.6 cursor=True fix
----
-
-![cursor fix before/after](https://raw.githubusercontent.com/zen-ham/rustcam/master/docs/cursor_fix_before_after.png)
-
-Up through v0.0.5, `cursor=True` had a hidden bottleneck on realistic moving content. `draw_cursor` used `IDXGISurface1::GetDC` on a `MISC_GDI_COMPATIBLE` texture, which is a CPU↔GPU sync point. When DWM was awake compositing other windows (which is *most actual desktop work*), the sync queued behind DWM's per-vsync work and capped cursor=True throughput at **47 fps**, vs ~150 for cursor=False. flip_demo hid the issue because it triggers Independent Flip, which puts DWM to sleep entirely.
-
-v0.0.6 drops GDI entirely. The cursor is now composited in software using DDA's own `PointerPosition` + `GetFramePointerShape`, in three blend modes (color alpha-blend, masked-color XOR, monochrome AND/XOR for the inverting I-beam case). No GDI, no `MISC_GDI_COMPATIBLE` flag, no GPU sync barrier. **`cursor=True` on mover.py now runs at ~117 fps with tight error bars (115-119 across 5 runs)**, basically indistinguishable from `cursor=False` (~125 fps under the same noise).
-
-This was the single biggest correctness/perf issue in the v0.0.5 line. If you've been using `cursor=True` and seeing dropped frames under windowed apps, v0.0.6 is the upgrade you want.
-
-The `cursor=True` cell on mover.py was 47 fps in v0.0.5. The GDI cursor compositing path (`DrawIconEx` on the GDI-compatible BGRA texture) used to sync with the GPU every frame; that sync stalled under DWM contention. v0.0.6 removes that entirely.
-
 Why this is faster
 ---
 
