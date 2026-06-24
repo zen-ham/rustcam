@@ -31,9 +31,9 @@ dependencies = [
 dynamic = ["version"]
 
 [project.urls]
-Homepage   = "https://github.com/zen-ham/rustcam"
-Repository = "https://github.com/zen-ham/rustcam"
-Issues     = "https://github.com/zen-ham/rustcam/issues"
+Homepage   = "https://gitlab.com/zenham/rustcam"
+Repository = "https://gitlab.com/zenham/rustcam"
+Issues     = "https://gitlab.com/zenham/rustcam/-/issues"
 
 [tool.maturin]
 module-name   = "rustcam._rustcam"

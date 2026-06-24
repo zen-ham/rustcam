@@ -6,7 +6,7 @@ rust-version = "1.83"
 description  = "Rust-backed Windows DXGI Desktop Duplication API screen capture for Python."
 license      = "MIT"
 authors      = ["zen-ham <again.really.plz@gmail.com>"]
-repository   = "https://github.com/zen-ham/rustcam"
+repository   = "https://gitlab.com/zenham/rustcam"
 
 [lib]
 name        = "rustcam"
@@ -14,14 +14,14 @@ crate-type  = ["cdylib", "rlib"]
 
 [dependencies]
 # Shared DDA capture foundation. Sister project at
-# https://github.com/zen-ham/dda_capture — both rustcam (PyO3 extension)
+# https://gitlab.com/zenham/dda_capture — both rustcam (PyO3 extension)
 # and zentape (NV12 video encoder) depend on it. Single source of truth
 # for cursor compositing, region cropping, and the DDA error type.
 # For local development of dda_capture alongside rustcam, add this to
 # `$HOME/.cargo/config.toml`:
-#     [patch.'https://github.com/zen-ham/dda_capture']
+#     [patch.'https://gitlab.com/zenham/dda_capture']
 #     dda_capture = { path = "c:/pywork/packages/dda_capture" }
-dda_capture       = { git = "https://github.com/zen-ham/dda_capture", branch = "master" }
+dda_capture       = { git = "https://gitlab.com/zenham/dda_capture", branch = "master" }
 pyo3              = { version = "0.28", features = ["abi3-py39", "extension-module", "generate-import-lib"] }
 numpy             = "0.28"
 parking_lot       = "0.12"

@@ -1,7 +1,7 @@
 `rustcam`
 ===
 
-[![PyPI](https://img.shields.io/pypi/v/rustcam?logo=pypi&color=blue)](https://pypi.org/project/rustcam/) [![Downloads](https://static.pepy.tech/badge/rustcam)](https://pypi.org/project/rustcam/) [![GitHub](https://img.shields.io/badge/GitHub-rustcam-blue?logo=github)](https://github.com/zen-ham/rustcam) [![stars](https://img.shields.io/github/stars/zen-ham/rustcam?style=social)](https://github.com/zen-ham/rustcam)
+[![PyPI](https://img.shields.io/pypi/v/rustcam?logo=pypi&color=blue)](https://pypi.org/project/rustcam/) [![Downloads](https://static.pepy.tech/badge/rustcam)](https://pypi.org/project/rustcam/) [![GitHub](https://img.shields.io/badge/GitHub-rustcam-blue?logo=github)](https://gitlab.com/zenham/rustcam) [![stars](https://img.shields.io/gitlab/stars/zenham/rustcam?style=social)](https://gitlab.com/zenham/rustcam)
 
 Fast DXGI Desktop Duplication screen capture for Windows, in Rust.
 
@@ -28,7 +28,7 @@ Windows only. DDA is the `IDXGIOutputDuplication` interface, which is Win8+. The
 Performance
 ---
 
-![benchmark](https://raw.githubusercontent.com/zen-ham/rustcam/master/docs/benchmark.png)
+![benchmark](https://gitlab.com/zenham/rustcam/-/raw/master/docs/benchmark.png)
 
 `benches/flip_demo_bench.py` runs each library against two stimuli, on a 1920x1080 / 180 Hz monitor backed by a GTX 1660 Ti:
 
@@ -164,7 +164,7 @@ Future work
 Shared `dda_capture` crate
 ---
 
-The DDA-specific bits (cursor compositor, region/crop, error type) live in a shared Rust crate at [github.com/zen-ham/dda_capture](https://github.com/zen-ham/dda_capture) so this package and [zentape](https://github.com/zen-ham/zentape) (a native NV12 video encoder that uses the same DDA capture path) can share one implementation. The cursor=True fix in particular was the kind of subtle bug nobody wants to debug twice — having it in one place means a fix to rustcam ports straight to zentape and vice versa. The crate is a normal cargo git dep, no path tricks needed.
+The DDA-specific bits (cursor compositor, region/crop, error type) live in a shared Rust crate at [github.com/zen-ham/dda_capture](https://gitlab.com/zenham/dda_capture) so this package and [zentape](https://gitlab.com/zenham/zentape) (a native NV12 video encoder that uses the same DDA capture path) can share one implementation. The cursor=True fix in particular was the kind of subtle bug nobody wants to debug twice — having it in one place means a fix to rustcam ports straight to zentape and vice versa. The crate is a normal cargo git dep, no path tricks needed.
 
 License
 ---
