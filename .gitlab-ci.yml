@@ -1,0 +1,53 @@
+# Wheel build for rustcam.
+#
+# rustcam is Windows-only (DXGI Desktop Duplication). The maintainer's local
+# updater.py builds the Windows abi3 wheel via `maturin build --release` and
+# uploads it to pypi BEFORE pushing the tag that fires this pipeline.
+#
+# What this CI does:
+#   - On every push: smoke-build the sdist + import-check that the source tree
+#     is well-formed.
+#   - On a v* tag push: also upload the sdist to pypi (skip-existing keeps it
+#     idempotent with the local updater.py upload).
+#
+# Windows wheels are NOT built here — gitlab.com shared runners are Linux-only
+# on the free tier. The local maintainer build covers Windows. If you need
+# Windows from CI later, set up self-hosted runners or use Cirrus CI.
+#
+# REQUIRED CI/CD VARIABLE: set PYPI_API_TOKEN at:
+#   gitlab.com/zenham/rustcam/-/settings/ci_cd  ->  Variables -> Add
+#   key: PYPI_API_TOKEN
+#   value: <pypi token, starts with "pypi-...">
+#   flags: Protected (off), Masked (on), Hidden (on)
+
+stages:
+  - build
+  - publish
+
+build_sdist:
+  stage: build
+  image: rust:1-bookworm
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq python3 python3-pip python3-venv >/dev/null
+    - python3 -m venv /opt/venv
+    - . /opt/venv/bin/activate && pip install -q --upgrade pip maturin==1.14.0
+  script:
+    - . /opt/venv/bin/activate && maturin sdist --out dist
+    - ls -lah dist
+  artifacts:
+    paths:
+      - dist/*.tar.gz
+    expire_in: 7 days
+
+upload_pypi:
+  stage: publish
+  image: python:3.12
+  needs:
+    - job: build_sdist
+      artifacts: true
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^v.*$/
+  before_script:
+    - python -m pip install -q --upgrade pip twine
+  script:
+    - twine upload --skip-existing --non-interactive -u __token__ -p "$PYPI_API_TOKEN" --verbose dist/*.tar.gz
